@@ -1,48 +1,48 @@
 # Ditto Vault — Technical Architecture
 
-> Canton Network · CIP-56 · Daml Smart Contracts
+> Canton Network · CIP-56 · Hybrid On-Chain/Off-Chain Design
 
 ---
 
 ## Table of Contents
 
 - [1. System Overview](#1-system-overview)
-- [2. Canton Domain Model](#2-canton-domain-model)
-- [3. CIP-56 Token Integration](#3-cip-56-token-integration)
-- [4. NAV Oracle & Pricing](#4-nav-oracle--pricing)
+- [2. On-Chain: CIP-56 Token Contracts](#2-on-chain-cip-56-token-contracts)
+- [3. Off-Chain: PostgreSQL State](#3-off-chain-postgresql-state)
+- [4. Memo-Based Routing](#4-memo-based-routing)
 - [5. Lifecycle Flows](#5-lifecycle-flows)
-- [6. Liquidity Pool](#6-liquidity-pool)
-- [7. Cross-Chain Bridge](#7-cross-chain-bridge)
-- [8. Backend Services](#8-backend-services)
-- [9. Security Model](#9-security-model)
-- [10. Deployment Architecture](#10-deployment-architecture)
-- [11. Why Ditto?](#11-why-ditto)
-- [12. References](#12-references)
+- [6. Custodial vs Non-Custodial](#6-custodial-vs-non-custodial)
+- [7. NAV Oracle & Pricing](#7-nav-oracle--pricing)
+- [8. Cross-Chain Bridge](#8-cross-chain-bridge)
+- [9. Backend Services](#9-backend-services)
+- [10. Security Model](#10-security-model)
+- [11. Deployment Architecture](#11-deployment-architecture)
+- [12. Why Ditto?](#12-why-ditto)
+- [13. References](#13-references)
 
 ---
 
 ## 1. System Overview
 
-Ditto Vault operates across two execution environments connected by a backend orchestration layer:
+Ditto Vault operates with a **hybrid on-chain/off-chain architecture** across two execution environments:
 
-- **Canton Network** — tokenization, accounting, and settlement via Daml smart contracts and CIP-56 token standard
-- **EVM Chains** — yield generation across DeFi money markets (Aave, Morpho, Fluid, Spark), secured by Ditto Network's 16 decentralized operators
+- **Canton Network** — CIP-56 token contracts for dvUSDC and USDCx (mint, burn, transfer). The only Daml code deployed on-chain.
+- **Application Server** — PostgreSQL for vault accounting, queue management, user state. Express.js API for business logic and frontend serving.
+- **EVM Chains** — yield generation across DeFi money markets (Aave, Morpho, Fluid, Spark), secured by Ditto Network's 16 decentralized operators.
 
-The Canton side never touches actual funds in the MVP. It tracks NAV, manages vault shares (dvUSDC), and provides institutional-grade workflows. The EVM side is the existing yield engine. A backend service bridges state between the two.
+This design keeps on-chain contracts minimal (tokens only), moves all mutable vault state off-chain, and uses memo-based routing for permissionless deposit/withdrawal without requiring user party registration.
 
 ```mermaid
 flowchart TB
-    subgraph Canton["Canton Network (Daml)"]
-        VS["VaultState\nNAV, shares, sharePrice"]
-        DV["dvUSDC\nCIP-56 Holdings"]
-        WF["DepositOffer /\nWithdrawRequest /\nYieldClaim"]
+    subgraph Canton["Canton Network (CIP-56 Only)"]
+        DV["dvUSDC\nHolding + BurnMintFactory"]
+        UX["USDCx\nHolding + BurnMintFactory"]
     end
 
-    subgraph Backend["Backend Services"]
-        LB["Lifecycle Bot"]
-        NO["NAV Oracle"]
-        LP["LP Market Maker"]
-        UM["UTXO Manager"]
+    subgraph App["Application Server"]
+        BE["Express.js API\n+ React Frontend"]
+        DB["PostgreSQL\nvault_state · queues · users"]
+        BE <--> DB
     end
 
     subgraph EVM["EVM Yield Engine"]
@@ -53,299 +53,412 @@ flowchart TB
         Spark
     end
 
-    Canton <-->|"JSON Ledger API"| Backend
-    Backend <-->|"RPC / Web3"| EVM
+    Canton <-->|"JSON Ledger API v2"| BE
+    BE <-->|"NAV Oracle / Bridge"| EVM
 
     style Canton fill:#0d1117,stroke:#7ae99d,color:#fff
-    style Backend fill:#0d1117,stroke:#4dabf7,color:#fff
+    style App fill:#0d1117,stroke:#4dabf7,color:#fff
     style EVM fill:#0d1117,stroke:#ffb84d,color:#fff
 ```
 
----
+### Why Hybrid?
 
-## 2. Canton Domain Model
+The initial design placed all vault state on-chain in Daml contracts (VaultState, DepositOffer, WithdrawRequest). Development experience revealed several practical issues:
 
-All on-chain state lives in Daml contracts deployed to the Canton participant node. The contracts follow Canton's ledger model: contracts are immutable, exercised choices consume the input contract and create new ones (UTXO-style).
+1. **UTXO churn** — Every VaultState update (NAV, shares, reserves) archives and recreates the contract. The backend must continuously track the latest contract ID.
+2. **Query limitations** — Canton's active contracts API ignores template filters and has a 200-element response limit, requiring client-side filtering and pagination.
+3. **Transaction cost** — Every queue entry and state change costs Canton traffic credits. Queue management is pure bookkeeping that gains nothing from on-chain execution.
+4. **Atomic complexity** — Combining queue clearing + token minting + state update in a single Canton transaction creates deeply nested multi-contract exercises.
 
-### 2.1 VaultState
-
-Singleton contract owned by the vault operator (curator). Tracks pool-level accounting.
-
-```daml
-template VaultState
-  with
-    vaultId       : Text
-    operator      : Party
-    totalShares   : Decimal
-    currentNAV    : Decimal      -- total vault value in USDC terms
-    sharePrice    : Decimal      -- currentNAV / totalShares
-    lastNAVUpdate : Time
-    feeRateBps    : Int          -- management fee in basis points (50-200)
-    isPaused      : Bool         -- emergency pause flag
-  where
-    signatory operator
-
-    choice UpdateNAV : ContractId VaultState
-      with
-        newNAV     : Decimal
-        updateTime : Time
-      controller operator
-      do
-        assertMsg "Vault is paused" (not isPaused)
-        assertMsg "NAV must be non-negative" (newNAV >= 0.0)
-        let newPrice = if totalShares > 0.0
-              then newNAV / totalShares
-              else 1.0
-        create this with
-          currentNAV = newNAV
-          sharePrice = newPrice
-          lastNAVUpdate = updateTime
-
-    choice RecordMint : ContractId VaultState
-      with
-        mintedShares  : Decimal
-        depositAmount : Decimal
-      controller operator
-      do
-        assertMsg "Shares must be positive" (mintedShares > 0.0)
-        create this with
-          totalShares = totalShares + mintedShares
-          currentNAV  = currentNAV + depositAmount
-
-    choice RecordBurn : ContractId VaultState
-      with
-        burnedShares   : Decimal
-        withdrawAmount : Decimal
-      controller operator
-      do
-        assertMsg "Shares must be positive" (burnedShares > 0.0)
-        assertMsg "Cannot burn more than total" (burnedShares <= totalShares)
-        create this with
-          totalShares = totalShares - burnedShares
-          currentNAV  = currentNAV - withdrawAmount
-
-    choice PauseVault : ContractId VaultState
-      controller operator
-      do create this with isPaused = True
-
-    choice UnpauseVault : ContractId VaultState
-      controller operator
-      do create this with isPaused = False
-```
-
-**Key invariants:**
-- `sharePrice = currentNAV / totalShares` (when `totalShares > 0`)
-- Only the operator can exercise choices (curator-gated)
-- `isPaused` blocks NAV updates and, by extension, all minting/burning
-
-### 2.2 DepositOffer
-
-Created by a user (depositor) to request entry into the vault.
-
-```daml
-template DepositOffer
-  with
-    depositor     : Party
-    operator      : Party
-    depositAmount : Decimal      -- USDCx amount
-    createdAt     : Time
-  where
-    signatory depositor
-    observer operator
-
-    choice AcceptDeposit : ()
-      with
-        sharesToMint : Decimal
-        vaultStateId : ContractId VaultState
-      controller operator
-      do
-        assertMsg "Shares must be positive" (sharesToMint > 0.0)
-        -- Operator validates: sharesToMint ≈ depositAmount / sharePrice
-        -- Actual mint via BurnMintFactory happens in the backend transaction
-        -- RecordMint on VaultState happens in the same transaction
-        pure ()
-
-    choice CancelDeposit : ()
-      controller depositor
-      do pure ()
-
-    choice RejectDeposit : ()
-      controller operator
-      do pure ()
-```
-
-### 2.3 WithdrawRequest
-
-Created by a dvUSDC holder to request redemption.
-
-```daml
-template WithdrawRequest
-  with
-    holder        : Party
-    operator      : Party
-    sharesToBurn  : Decimal      -- dvUSDC amount
-    createdAt     : Time
-  where
-    signatory holder
-    observer operator
-
-    choice AcceptWithdraw : ()
-      with
-        redemptionAmount : Decimal   -- USDCx to return
-        vaultStateId     : ContractId VaultState
-      controller operator
-      do
-        assertMsg "Redemption must be positive" (redemptionAmount > 0.0)
-        -- Operator validates: redemptionAmount ≈ sharesToBurn * sharePrice
-        -- Actual burn via BurnMintFactory happens in the backend transaction
-        -- RecordBurn on VaultState happens in the same transaction
-        pure ()
-
-    choice CancelWithdraw : ()
-      controller holder
-      do pure ()
-```
-
-### 2.4 YieldClaim
-
-Allows a user to harvest accrued yield without redeeming their full position.
-
-```daml
-template YieldClaim
-  with
-    holder          : Party
-    operator        : Party
-    initialShares   : Decimal    -- shares at time of deposit
-    currentShares   : Decimal    -- shares held now (same count)
-    autoCompound    : Bool       -- if True, reinvest yield
-  where
-    signatory holder
-    observer operator
-
-    choice AcceptClaim : ()
-      with
-        yieldInUSDCx   : Decimal
-        sharesToBurn   : Decimal  -- yield portion expressed in shares
-        vaultStateId   : ContractId VaultState
-      controller operator
-      do
-        assertMsg "Yield must be positive" (yieldInUSDCx > 0.0)
-        -- If autoCompound: burn yield shares, immediately re-mint at current price
-        -- If not: burn yield shares, transfer USDCx to holder
-        pure ()
-```
+Moving vault accounting to PostgreSQL eliminates all of these while preserving the most valuable on-chain component: **CIP-56 token standard compliance** for dvUSDC, enabling wallet compatibility, DvP settlement, and Featured App activity markers.
 
 ---
 
-## 3. CIP-56 Token Integration
+## 2. On-Chain: CIP-56 Token Contracts
 
-dvUSDC is a CIP-56-compliant token, making it interoperable with any Canton wallet, DvP settlement flow, and third-party Canton applications.
+The only Daml contracts deployed to Canton are CIP-56 token interfaces — Holding and BurnMintFactory for both dvUSDC and USDCx.
 
-### 3.1 Token Registration
+### 2.1 Token Interfaces
 
-The vault operator registers as an **Instrument Admin** in the Canton Registry Utility:
+Each token implements two CIP-56 interfaces:
 
-1. **Create `AllocationFactory`** — enables users to lock dvUSDC holdings for transfer offers and DvP settlement
-2. **Create `TransferRule`** — defines credential requirements for peer-to-peer dvUSDC transfers
-
-Registration makes dvUSDC discoverable in Canton wallets and enables activity marker generation.
-
-### 3.2 Instrument Metadata
-
-```
-Instrument ID    : dvUSDC
-Instrument Admin : <operator-party-id>
-Token Standard   : CIP-56
-Decimals         : 6
-Description      : Ditto Vault yield-bearing USDC token
-```
-
-### 3.3 Minting (on deposit)
-
-```mermaid
-flowchart LR
-    A["User creates\nDepositOffer"] --> B["Operator calls\nBurnMintFactory_BurnMint"]
-    B --> C["action = Mint\nowner = depositor\namount = depositAmount / sharePrice"]
-    C --> D["New Holding\ncreated for depositor"]
-    D --> E["Activity marker\n(MintOffer_Accept)"]
-```
-
-### 3.4 Burning (on withdrawal)
-
-```mermaid
-flowchart LR
-    A["User creates\nWithdrawRequest"] --> B["Operator fetches Holdings\nvia HoldingV1 interface"]
-    B --> C["Operator calls\nBurnMintFactory_BurnMint"]
-    C --> D["action = Burn\nholdings = user's contract IDs\namount = sharesToBurn"]
-    D --> E["Holdings consumed"]
-    E --> F["Activity marker\n(BurnOffer_Accept)"]
-```
-
-### 3.5 Transfers
-
-Standard CIP-56 peer-to-peer transfers via `TransferFactory_Transfer`:
-
-```mermaid
-flowchart LR
-    A["Sender creates\nTransferInstruction"] --> B["Receiver\naccepts"]
-    B --> C["Sender's Holding consumed\nNew Holding for receiver"]
-    C --> D["Activity marker\n(TransferInstruction_Accept)"]
-```
-
-### 3.6 Holdings (UTXO Model)
-
-CIP-56 holdings follow a UTXO model. Each mint creates a new holding contract. Multiple deposits create multiple holdings for the same user.
-
-**Fragmentation management:**
-- `MergeDelegation` allows the operator to merge multiple small holdings into one, reducing state and earning additional activity markers
-- The backend periodically scans for users with >N holdings and triggers merges
-
----
-
-## 4. NAV Oracle & Pricing
-
-### 4.1 NAV Update Flow
-
-```mermaid
-flowchart LR
-    EVM["EVM Yield Engine\n(Aave, Morpho, Fluid, Spark)"]
-    NAV["NAV Oracle\n(Backend)"]
-    VS["VaultState\n(Canton)"]
-
-    EVM -->|"read TVL\ntotalAssets()"| NAV
-    NAV -->|"exercise UpdateNAV\npost netNAV"| VS
-```
-
-1. NAV Oracle reads total vault value from EVM vault contracts via RPC
-2. Applies management fee accrual: `netNAV = grossNAV - accruedFee`
-3. Exercises `UpdateNAV` on VaultState with the net NAV
-4. VaultState recalculates `sharePrice = currentNAV / totalShares`
-
-### 4.2 Update Frequency
-
-| Phase | Frequency | Rationale |
+| Interface | Type | Purpose |
 |---|---|---|
-| MVP | Every 15 minutes | Sufficient for demo, generates ~96 NAV updates/day |
-| Production | Every block (~12s) or on significant NAV change (>0.1%) | Real-time accuracy for institutional users |
+| **Holding** | Consuming | Represents a balance owned by a party. Consumed on transfer/burn. |
+| **BurnMintFactory** | Nonconsuming | Factory for atomic burn-and-mint operations. Multiple exercises per transaction. |
 
-### 4.3 Share Price Calculation
+The nonconsuming nature of BurnMintFactory is critical — it allows multiple token operations (deposits, mints, transfers) to reference the same factory contract in a single atomic Canton transaction.
+
+### 2.2 dvUSDC (Vault Shares)
 
 ```
-sharePrice = currentNAV / totalShares
-
-On deposit:
-  sharesToMint = depositAmount / sharePrice
-
-On withdrawal:
-  redemptionAmount = sharesToBurn × sharePrice
-
-Yield per user:
-  yieldValue = (currentSharePrice - entrySharePrice) × userShares
+Instrument ID    : { admin: operatorParty, id: "dvUSDC" }
+Token Standard   : CIP-56 (Holding + BurnMintFactory)
+Precision        : Numeric(10)
 ```
 
-### 4.4 Fee Accrual
+dvUSDC represents proportional ownership of the vault's NAV. Share price increases as yield accumulates from EVM strategies.
 
-Management fee is accrued continuously and deducted from NAV before posting:
+### 2.3 USDCx (Stablecoin)
+
+```
+Instrument ID    : { admin: operatorParty, id: "USDCx" }
+Token Standard   : CIP-56 (Holding + BurnMintFactory)
+Precision        : Numeric(10)
+```
+
+USDCx is the deposit token. In production, this will be the Canton-native USDC stablecoin via Circle xReserve. During development, the operator mints test USDCx for validation.
+
+### 2.4 UTXO Model
+
+CIP-56 Holdings follow a UTXO model:
+
+- **Mint**: Factory creates new Holding contract(s) — one per output recipient
+- **Transfer**: Burns sender's Holding(s), mints new Holding(s) for recipient + change back to sender
+- **Burn**: Consumes Holding(s), reduces total supply
+
+Multiple Holdings for the same owner are valid and common. The backend aggregates all holdings to determine a party's total balance.
+
+### 2.5 Atomic Batch Operations
+
+The BurnMintFactory `BurnMint` choice accepts multiple input holdings and produces multiple outputs in a single exercise:
+
+```
+inputs:   [holdingCid1, holdingCid2, ...]  — consumed
+outputs:  [{ owner: partyA, amount: X }, { owner: partyB, amount: Y }, ...]  — created
+```
+
+This enables atomic transfers with change, multi-recipient distributions, and combined operations in a single Canton transaction. The operator's `actAs` authority is required for all CIP-56 operations.
+
+---
+
+## 3. Off-Chain: PostgreSQL State
+
+All vault accounting, queue management, and user state lives in PostgreSQL.
+
+### 3.1 vault_state (Singleton)
+
+```sql
+CREATE TABLE vault_state (
+    id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    nav             DECIMAL(30,10) DEFAULT 0,
+    total_shares    DECIMAL(30,10) DEFAULT 0,
+    share_price     DECIMAL(30,10) DEFAULT 1,
+    vault_reserve   DECIMAL(30,10) DEFAULT 0,
+    evm_vault_balance DECIMAL(30,10) DEFAULT 0,
+    is_paused       BOOLEAN DEFAULT FALSE,
+    last_nav_update TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+Enforced as a singleton via `CHECK (id = 1)`. Updated atomically on every deposit clearing, withdrawal clearing, NAV update, and reserve operation.
+
+### 3.2 deposit_queue
+
+```sql
+CREATE TABLE deposit_queue (
+    id              SERIAL PRIMARY KEY,
+    sender_party    VARCHAR(500) NOT NULL,
+    amount          DECIMAL(30,10) NOT NULL,
+    mint_target     VARCHAR(500) NOT NULL,
+    withdrawal_memo TEXT DEFAULT '',
+    status          VARCHAR(20) DEFAULT 'pending',
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    cleared_at      TIMESTAMPTZ
+);
+```
+
+Entries created when USDCx is transferred to the operator with a routing memo. `mint_target` is the Canton party that will receive dvUSDC shares.
+
+### 3.3 withdrawal_queue
+
+```sql
+CREATE TABLE withdrawal_queue (
+    id               SERIAL PRIMARY KEY,
+    sender_party     VARCHAR(500) NOT NULL,
+    dvusdc_amount    DECIMAL(30,10) NOT NULL,
+    payout_target    VARCHAR(500) NOT NULL,
+    withdrawal_memo  TEXT DEFAULT '',
+    status           VARCHAR(20) DEFAULT 'pending',
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    cleared_at       TIMESTAMPTZ
+);
+```
+
+Entries created when dvUSDC is transferred to the operator with a routing memo. `payout_target` is the Canton party that will receive USDCx redemption.
+
+### 3.4 users
+
+```sql
+CREATE TABLE users (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username            VARCHAR(255) UNIQUE NOT NULL,
+    password_hash       VARCHAR(255) NOT NULL,
+    mode                VARCHAR(20) NOT NULL DEFAULT 'non_custodial'
+                        CHECK (mode IN ('custodial', 'non_custodial')),
+    party_id            VARCHAR(500) NOT NULL,
+    withdrawal_address  VARCHAR(500),
+    withdrawal_memo     VARCHAR(500) DEFAULT '',
+    referral_code       VARCHAR(100),
+    deposit_memo        VARCHAR(500),
+    custodial_dvusdcx   DECIMAL(30,10) DEFAULT 0,
+    role                VARCHAR(20) DEFAULT 'user'
+                        CHECK (role IN ('admin', 'user')),
+    faucet_used         BOOLEAN DEFAULT FALSE,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+Custodial users share a treasury party on-chain. The `custodial_dvusdcx` column tracks each user's individual share balance.
+
+### 3.5 supported_deposit_tokens
+
+```sql
+CREATE TABLE supported_deposit_tokens (
+    id          SERIAL PRIMARY KEY,
+    token_id    VARCHAR(100) NOT NULL,
+    label       VARCHAR(255),
+    enabled     BOOLEAN DEFAULT TRUE,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+Operator-configurable. The frontend and API use this to determine which tokens are accepted for deposits. Enables seamless migration from test tokens to production stablecoins.
+
+---
+
+## 4. Memo-Based Routing
+
+The memo is the core routing primitive. It eliminates the need for user-signed workflow contracts (DepositOffer, WithdrawRequest) and enables fully permissionless interactions.
+
+### 4.1 Memo Format
+
+```
+{targetPartyId} {optionalMemo}
+```
+
+Canton party IDs contain no spaces, so the first space-delimited token is always the target address. Everything after is the forwarding memo.
+
+### 4.2 Deposit Memo Examples
+
+```
+# Non-custodial: mint shares to my own party
+alice::1220abc...   my-reference-123
+
+# Custodial: mint shares to treasury, credit user's DB account
+ditto-treasury::1220abc...   550e8400-e29b-41d4-a716-446655440000
+```
+
+### 4.3 Why Memos?
+
+The original design used Daml workflow contracts (DepositOffer, WithdrawRequest) signed by the user. This required:
+- User party registration on the Canton participant
+- User authority (actAs rights) to create the contract
+- Operator authority to accept the contract
+- Contract ID tracking for queue management
+
+Memo-based routing removes all of this. Any Canton party can deposit by simply transferring tokens to the operator with a self-describing memo. The backend parses the memo, queues the operation in PostgreSQL, and the operator clears it through CIP-56 token operations.
+
+---
+
+## 5. Lifecycle Flows
+
+### 5.1 Deposit Flow (USDCx → dvUSDC)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant BE as Backend
+    participant DB as PostgreSQL
+    participant CN as Canton (CIP-56)
+
+    User->>BE: POST /api/deposit { senderPartyId, amount, memo }
+
+    rect rgb(30, 50, 30)
+        Note over BE,CN: On-Chain: Transfer USDCx
+        BE->>CN: BurnMintFactory_BurnMint<br/>Burn sender USDCx<br/>Mint to operator
+    end
+
+    BE->>DB: INSERT INTO deposit_queue<br/>(sender, amount, mint_target)
+    BE-->>User: Queued
+
+    Note over BE: Operator clears queue
+
+    BE->>DB: Read pending deposits
+    BE->>DB: Read vault_state (sharePrice)
+    Note over BE: sharesToMint = amount / sharePrice
+
+    rect rgb(30, 50, 30)
+        Note over BE,CN: On-Chain: Mint dvUSDC
+        BE->>CN: BurnMintFactory_BurnMint<br/>Mint dvUSDC to mint_target
+    end
+
+    BE->>DB: UPDATE vault_state<br/>nav += amount<br/>total_shares += minted
+    BE->>DB: UPDATE deposit_queue SET status = 'cleared'
+
+    alt mint_target is treasury
+        BE->>DB: UPDATE users SET custodial_dvusdcx += minted<br/>WHERE id = memo_uuid
+    end
+
+    BE-->>User: Shares minted
+```
+
+### 5.2 Withdrawal Flow (dvUSDC → USDCx)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant BE as Backend
+    participant DB as PostgreSQL
+    participant CN as Canton (CIP-56)
+
+    User->>BE: POST /api/withdraw { senderPartyId, dvUsdcAmount, memo }
+
+    rect rgb(30, 50, 30)
+        Note over BE,CN: On-Chain: Transfer dvUSDC
+        BE->>CN: BurnMintFactory_BurnMint<br/>Burn sender dvUSDC<br/>Mint to operator
+    end
+
+    BE->>DB: INSERT INTO withdrawal_queue<br/>(sender, amount, payout_target)
+    BE-->>User: Queued
+
+    Note over BE: Operator clears queue
+
+    BE->>DB: Read pending withdrawals
+    BE->>DB: Read vault_state (sharePrice)
+    Note over BE: redemption = dvUsdcAmount × sharePrice
+
+    rect rgb(30, 50, 30)
+        Note over BE,CN: On-Chain: Burn dvUSDC + Transfer USDCx
+        BE->>CN: BurnMintFactory_BurnMint<br/>Burn operator's dvUSDC
+        BE->>CN: BurnMintFactory_BurnMint<br/>Transfer USDCx to payout_target
+    end
+
+    BE->>DB: UPDATE vault_state<br/>nav -= redemption<br/>total_shares -= burned
+    BE->>DB: UPDATE withdrawal_queue SET status = 'cleared'
+    BE-->>User: USDCx returned
+```
+
+### 5.3 Deposit Shares (dvUSDC → Custodial Account)
+
+A direct path for crediting dvUSDC to a custodial user's account without going through the queue.
+
+```mermaid
+sequenceDiagram
+    actor Sender
+    participant BE as Backend
+    participant DB as PostgreSQL
+    participant CN as Canton (CIP-56)
+
+    Sender->>BE: POST /api/deposit-shares { senderPartyId, amount, memo: userUUID }
+    BE->>DB: Look up custodial user by UUID
+
+    rect rgb(30, 50, 30)
+        Note over BE,CN: On-Chain: Transfer dvUSDC to Treasury
+        BE->>CN: BurnMintFactory_BurnMint<br/>Burn sender dvUSDC<br/>Mint to treasury
+    end
+
+    BE->>DB: UPDATE users SET custodial_dvusdcx += amount<br/>WHERE id = userUUID
+    BE-->>Sender: Credited immediately
+```
+
+No queue is used. The on-chain transfer and DB credit happen in a single request.
+
+### 5.4 Share Transfer
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant BE as Backend
+    participant DB as PostgreSQL
+    participant CN as Canton (CIP-56)
+
+    User->>BE: POST /api/user/transfer-shares { toAddress, toMemo, amount }
+
+    alt Custodial sender
+        BE->>DB: Debit custodial_dvusdcx
+        rect rgb(30, 50, 30)
+            Note over BE,CN: On-Chain: Transfer from Treasury
+            BE->>CN: BurnMintFactory_BurnMint<br/>Burn treasury dvUSDC<br/>Mint to destination
+        end
+        Note over BE: If on-chain fails → rollback DB debit
+    else Non-custodial sender
+        rect rgb(30, 50, 30)
+            Note over BE,CN: On-Chain: Direct Transfer
+            BE->>CN: BurnMintFactory_BurnMint<br/>Burn sender dvUSDC<br/>Mint to destination
+        end
+    end
+
+    alt Destination is custodial user
+        BE->>DB: Credit custodial_dvusdcx for recipient
+    end
+
+    BE-->>User: Transfer complete
+```
+
+The backend implements **DB rollback** for custodial transfers: if the on-chain CIP-56 operation fails after the sender's DB balance has been debited, the debit is reversed.
+
+---
+
+## 6. Custodial vs Non-Custodial
+
+### 6.1 Non-Custodial Mode
+
+The user holds their own Canton party and interacts permissionlessly:
+
+- **Registration**: Backend allocates a Canton party and grants ledger rights
+- **Deposits**: User sends USDCx to operator with their party ID as memo
+- **Shares**: dvUSDC is minted directly to the user's party on-chain
+- **Withdrawals**: User sends dvUSDC to operator with their destination address
+- **Full control**: User holds CIP-56 tokens directly, can transfer peer-to-peer
+
+### 6.2 Custodial Mode
+
+The user gets a managed account backed by a shared treasury party:
+
+- **Registration**: User provides a referral code, gets a UUID and deposit memo
+- **Deposit memo format**: `{treasuryPartyId} {userUUID}`
+- **Shares**: dvUSDC is minted to the treasury party on-chain
+- **Balance tracking**: Individual balances in PostgreSQL `custodial_dvusdcx`
+- **Withdrawals**: Backend transfers from treasury on behalf of the user
+- **Transfers**: Backend debits sender, transfers on-chain, credits recipient if custodial
+
+### 6.3 Treasury Party
+
+A dedicated Canton party (`ditto-treasury`) holds all custodial users' dvUSDC. The on-chain treasury balance equals the sum of all custodial users' `custodial_dvusdcx` balances. This invariant is maintained by crediting/debiting the DB atomically with on-chain operations.
+
+---
+
+## 7. NAV Oracle & Pricing
+
+### 7.1 Share Price
+
+```
+sharePrice = nav / totalShares    (when totalShares > 0, else 1.0)
+
+On deposit:   sharesToMint    = depositAmount / sharePrice
+On withdraw:  redemptionAmount = sharesToBurn × sharePrice
+Yield:        sharePrice rises as EVM yield increases NAV
+```
+
+### 7.2 NAV Update Flow
+
+```mermaid
+flowchart LR
+    EVM["EVM Yield Engine\ntotalAssets()"]
+    NAV["NAV Oracle\n(Backend)"]
+    DB["PostgreSQL\nvault_state"]
+
+    EVM -->|"read TVL"| NAV
+    NAV -->|"UPDATE vault_state\nSET nav = X,\nshare_price = X / total_shares"| DB
+```
+
+1. Backend reads total vault value from EVM vault contracts via RPC
+2. Applies management fee accrual
+3. Updates `nav` and `share_price` in PostgreSQL
+4. No on-chain transaction required for NAV updates — purely off-chain
+
+### 7.3 Fee Accrual
 
 ```
 annualFeeRate = feeRateBps / 10000
@@ -356,184 +469,13 @@ netNAV        = grossNAV - accruedFee
 
 ---
 
-## 5. Lifecycle Flows
+## 8. Cross-Chain Bridge
 
-### 5.1 Deposit Flow
+### 8.1 Current State (MVP)
 
-```mermaid
-sequenceDiagram
-    actor User
-    participant FE as Frontend
-    participant BE as Backend (Operator)
-    participant CN as Canton Ledger
+No actual fund movement between Canton and EVM. The NAV Oracle reads EVM vault TVL and posts it to PostgreSQL. Reserve management (fund vault, bridge to/from EVM) is bookkeeping via DB updates. CIP-56 USDCx on Canton is test-minted by the operator.
 
-    User->>FE: deposit(amount)
-    FE->>CN: create DepositOffer
-    CN-->>BE: DepositOffer contract active
-
-    BE->>CN: read VaultState
-    CN-->>BE: sharePrice
-
-    Note over BE: shares = amount / sharePrice
-
-    rect rgb(30, 50, 30)
-        Note over BE,CN: Atomic Transaction
-        BE->>CN: 1. AcceptDeposit
-        BE->>CN: 2. BurnMintFactory Mint(shares)
-        BE->>CN: 3. RecordMint on VaultState
-    end
-
-    CN-->>BE: Holding(dvUSDC) created
-    BE-->>FE: tx result
-    FE-->>User: confirmation
-```
-
-All three operations (accept deposit, mint dvUSDC, record mint) execute in a **single atomic Canton transaction**, guaranteeing consistent state.
-
-### 5.2 Withdrawal Flow
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant FE as Frontend
-    participant BE as Backend (Operator)
-    participant CN as Canton Ledger
-
-    User->>FE: withdraw(shares)
-    FE->>CN: create WithdrawRequest
-    CN-->>BE: WithdrawRequest contract active
-
-    BE->>CN: read VaultState
-    CN-->>BE: sharePrice
-
-    Note over BE: redemption = shares × sharePrice
-
-    rect rgb(30, 50, 30)
-        Note over BE,CN: Atomic Transaction
-        BE->>CN: 1. AcceptWithdraw
-        BE->>CN: 2. BurnMintFactory Burn(shares)
-        BE->>CN: 3. RecordBurn on VaultState
-    end
-
-    CN-->>BE: dvUSDC Holdings consumed
-    BE-->>FE: tx result + USDCx transfer
-    FE-->>User: USDCx returned
-```
-
-### 5.3 Yield Claim Flow
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant BE as Backend (Operator)
-    participant CN as Canton Ledger
-
-    User->>BE: claimYield()
-    BE->>CN: read user dvUSDC Holdings
-    BE->>CN: read VaultState
-    CN-->>BE: holdings + sharePrice
-
-    Note over BE: yieldShares = shares ×<br/>(1 - entryPrice / currentPrice)
-
-    rect rgb(30, 50, 30)
-        Note over BE,CN: Atomic Transaction
-        BE->>CN: 1. AcceptClaim
-        BE->>CN: 2. Burn(yieldShares)
-        BE->>CN: 3. RecordBurn
-        alt autoCompound = true
-            BE->>CN: 4. Re-mint at current price
-        else autoCompound = false
-            BE->>CN: 4. Transfer USDCx to holder
-        end
-    end
-
-    BE-->>User: yield distributed
-```
-
----
-
-## 6. Liquidity Pool
-
-An on-chain secondary market for instant dvUSDC exits without waiting for the withdrawal queue.
-
-### 6.1 Pool Design
-
-```daml
-template LiquidityPool
-  with
-    operator       : Party
-    dvUSDCReserve  : Decimal     -- dvUSDC in pool
-    usdcxReserve   : Decimal     -- USDCx in pool
-    swapFeeBps     : Int         -- 10-30 bps
-    lastRebalance  : Time
-  where
-    signatory operator
-
-    choice SwapDvUSDCForUSDCx : ContractId LiquidityPool
-      with
-        seller       : Party
-        dvUSDCAmount : Decimal
-      controller operator
-      do
-        let fee       = dvUSDCAmount * (intToDecimal swapFeeBps / 10000.0)
-            netAmount = dvUSDCAmount - fee
-            usdcxOut  = netAmount * (usdcxReserve / dvUSDCReserve)
-        assertMsg "Insufficient USDCx liquidity" (usdcxOut <= usdcxReserve)
-        create this with
-          dvUSDCReserve = dvUSDCReserve + dvUSDCAmount
-          usdcxReserve  = usdcxReserve - usdcxOut
-
-    choice Rebalance : ContractId LiquidityPool
-      with
-        newDvUSDCReserve : Decimal
-        newUSDCxReserve  : Decimal
-        rebalanceTime    : Time
-      controller operator
-      do create this with
-          dvUSDCReserve = newDvUSDCReserve
-          usdcxReserve  = newUSDCxReserve
-          lastRebalance = rebalanceTime
-```
-
-### 6.2 Arbitrage Mechanism
-
-```mermaid
-flowchart LR
-    subgraph BelowNAV["dvUSDC below NAV (discount)"]
-        direction TB
-        B1["Bot buys discounted dvUSDC\nfrom LP"] --> B2["Bot submits WithdrawRequest\nat full NAV price"]
-        B2 --> B3["Bot earns spread:\nNAV - LP price - fees"]
-        B3 --> B4["LP price converges\nback to NAV"]
-    end
-
-    subgraph AboveNAV["dvUSDC above NAV (premium)"]
-        direction TB
-        A1["Bot deposits USDCx via\nDepositOffer at NAV"] --> A2["Bot sells minted dvUSDC\non LP at premium"]
-        A2 --> A3["Bot earns spread:\nLP price - NAV - fees"]
-        A3 --> A4["LP price converges\nback to NAV"]
-    end
-```
-
-Each arbitrage cycle generates multiple CIP-56 transactions (mint, burn, transfer, swap) — all economically motivated.
-
-### 6.3 Transaction Generation
-
-| LP Operation | CIP-56 Transactions Generated |
-|---|---|
-| Swap dvUSDC → USDCx | Transfer (seller → pool) + Transfer (pool → seller) |
-| Arbitrage buy + redeem | Transfer (pool → bot) + Burn (bot dvUSDC) |
-| Arbitrage mint + sell | Mint (bot dvUSDC) + Transfer (bot → pool) |
-| Rebalance | Transfer(s) for reserve adjustments |
-
----
-
-## 7. Cross-Chain Bridge
-
-### 7.1 MVP (Phase 1–2)
-
-No actual fund movement. The NAV Oracle reads EVM vault TVL and posts it to Canton. Deposits/withdrawals are accounted on Canton only.
-
-### 7.2 Production (Phase 2+)
+### 8.2 Production (Phase 2+)
 
 Integration with **Circle xReserve** for actual USDCx ↔ USDC bridging:
 
@@ -546,246 +488,189 @@ sequenceDiagram
     participant EVM as EVM Vault
 
     Note over User,EVM: Deposit Flow
-    User->>CN: deposit USDCx
-    BE->>BR: initiate xReserve withdrawal (Canton → EVM)
+    User->>CN: Transfer USDCx to operator
+    BE->>BR: Initiate xReserve withdrawal (Canton → EVM)
     BR->>EVM: USDC received
-    BE->>EVM: deposit USDC into yield strategies
-    BE->>CN: UpdateNAV reflects new TVL
+    BE->>EVM: Deploy into yield strategies
+    BE->>BE: Update NAV in PostgreSQL
 
     Note over User,EVM: Withdrawal Flow
-    User->>CN: create WithdrawRequest
-    BE->>EVM: withdraw USDC from strategies
-    BE->>BR: initiate xReserve deposit (EVM → Canton)
+    User->>CN: Transfer dvUSDC to operator
+    BE->>EVM: Withdraw USDC from strategies
+    BE->>BR: Initiate xReserve deposit (EVM → Canton)
     BR->>CN: USDCx received
-    BE->>CN: transfer USDCx to user, burn dvUSDC, update VaultState
-```
-
-### 7.3 Bridge Architecture
-
-```mermaid
-flowchart LR
-    subgraph Canton["Canton Network"]
-        USDCx["USDCx"]
-    end
-
-    subgraph Bridge["Circle xReserve"]
-        BC["Bridge Contract"]
-    end
-
-    subgraph EVM["EVM"]
-        USDC["USDC (Ethereum)"]
-        VA["Ditto Vault Allocator"]
-        Aave
-        Morpho
-        Fluid
-        Spark
-    end
-
-    USDCx <-->|"deposit / withdraw"| BC
-    BC <-->|"lock / release"| USDC
-    USDC --- VA
-    VA --> Aave
-    VA --> Morpho
-    VA --> Fluid
-    VA --> Spark
+    BE->>CN: Transfer USDCx to user (CIP-56)
 ```
 
 ---
 
-## 8. Backend Services
+## 9. Backend Services
 
-The backend runs as a set of services that interact with both Canton (via JSON Ledger API) and EVM (via RPC).
+The backend is a single Express.js server handling all responsibilities:
 
-### 8.1 Lifecycle Bot
-
-Polls for pending workflow contracts and processes them atomically.
+### 9.1 Startup Sequence
 
 ```mermaid
 flowchart TD
-    Start["Poll (every 1-5s)"] --> D["Query active\nDepositOffer contracts"]
-    D --> D1["Calculate shares\nExecute atomic mint tx"]
-    D1 --> W["Query active\nWithdrawRequest contracts"]
-    W --> W1["Calculate redemption\nExecute atomic burn tx"]
-    W1 --> Y["Query active\nYieldClaim contracts"]
-    Y --> Y1["Calculate yield\nExecute claim tx"]
-    Y1 --> S["Query active\nLP SwapRequest contracts"]
-    S --> S1["Validate liquidity\nExecute swap"]
-    S1 --> Start
+    A["Server starts"] --> B["Initialize PostgreSQL tables\n(vault_state, queues, users, tokens)"]
+    B --> C["Authenticate with Canton\n(Keycloak or unsafe mode)"]
+    C --> D["Upload DAR to participant"]
+    D --> E["Allocate parties\n(operator, treasury)"]
+    E --> F["Grant ledger rights"]
+    F --> G["Discover CIP-56 Factory contracts\n(dvUSDC, USDCx)"]
+    G --> H["Mint initial USDCx supply\n(for testing)"]
+    H --> I["Initialize VaultState\n(if empty)"]
+    I --> J["Server ready on port 3434"]
 ```
 
-**Atomic transaction composition** (single Ledger API command):
-```json
-{
-  "commands": [
-    { "exercise": { "template": "DepositOffer", "choice": "AcceptDeposit", ... } },
-    { "exercise": { "template": "BurnMintFactory", "choice": "BurnMint_Mint", ... } },
-    { "exercise": { "template": "VaultState", "choice": "RecordMint", ... } }
-  ]
-}
-```
+### 9.2 Authentication
 
-All three commands execute atomically — if any fails, the entire transaction rolls back.
+Dual-mode authentication for Canton Ledger API:
 
-### 8.2 NAV Oracle
+| Mode | Mechanism | Use Case |
+|---|---|---|
+| `keycloak` | OAuth2 token from Keycloak IdP | Production validators |
+| `none` | No auth header, `userId: ledger-api-user` | Development / unsafe mode |
 
-```mermaid
-flowchart LR
-    T["Schedule:\nevery 15min (MVP)\nevery block (prod)"] --> A["Read EVM vault\ntotalAssets()"]
-    A --> B["Read EVM vault\ntotalSupply()"]
-    B --> C["Calculate mgmt\nfee accrual"]
-    C --> D["Post UpdateNAV\nto VaultState"]
-    D --> E["Log NAV history\nfor APY calc"]
-```
+User authentication is separate — JWT-based with bcryptjs password hashing.
 
-### 8.3 UTXO Manager
+### 9.3 Canton Ledger API Integration
 
-CIP-56 holdings follow a UTXO model. Frequent deposits create holding fragmentation.
+All on-chain interactions go through Canton's JSON Ledger API v2:
 
-```mermaid
-flowchart LR
-    T["Schedule:\nevery 1 hour"] --> Q["Query all dvUSDC\nHoldings by owner"]
-    Q --> F{"Owner has\n> 5 Holdings?"}
-    F -->|Yes| M["Exercise MergeDelegation\nConsolidate into 1 Holding"]
-    M --> AM["Activity marker\ngenerated"]
-    F -->|No| S["Skip"]
-```
+| Operation | API Endpoint |
+|---|---|
+| Upload DAR | `POST /v2/packages` |
+| Allocate party | `POST /v2/parties` |
+| Submit commands | `POST /v2/commands/submit-and-wait-for-transaction` |
+| Query contracts | `POST /v2/state/active-contracts` |
+| Get ledger offset | `GET /v2/state/ledger-end` |
 
-### 8.4 LP Market Maker
+The backend uses `actAs: [operatorParty]` for all commands. User parties are included as `actAs` when their authority is needed (e.g., transferring their tokens).
 
-```mermaid
-flowchart TD
-    M["Monitor LP price\nvs NAV oracle"] --> C{"LP price vs NAV"}
-    C -->|"LP < NAV - threshold"| Buy["Buy dvUSDC from LP\n(discounted)"]
-    Buy --> WR["Submit WithdrawRequest\nat NAV (full value)"]
-    WR --> P1["Pocket spread"]
-    C -->|"LP > NAV + threshold"| Dep["Submit DepositOffer\nat NAV"]
-    Dep --> Sell["Sell dvUSDC on LP\n(premium)"]
-    Sell --> P2["Pocket spread"]
-    C -->|"Within threshold"| Hold["No action"]
-```
+### 9.4 Smart Routing (Controller Dashboard)
+
+The controller dashboard implements intelligent routing for token sends:
+
+| Token | Memo? | Destination | Route |
+|---|---|---|---|
+| USDCx | Yes | Any | `POST /api/deposit` (enters deposit queue) |
+| dvUSDC | Yes | Treasury | `POST /api/deposit-shares` (instant custodial credit) |
+| dvUSDC | Yes | Operator | `POST /api/withdraw` (enters withdrawal queue) |
+| Any | No | Any | `POST /api/transfer` (raw CIP-56 transfer) |
 
 ---
 
-## 9. Security Model
+## 10. Security Model
 
-### 9.1 Canton Security (Daml)
-
-| Control | Implementation |
-|---|---|
-| **Authorization** | Every contract choice has explicit `controller` — only the designated party can exercise |
-| **Signatory model** | `DepositOffer` signed by depositor, observed by operator. Operator cannot forge deposits |
-| **Atomic execution** | Multi-contract transactions are all-or-nothing. No partial state updates |
-| **Privacy** | Canton's sub-transaction privacy ensures parties only see contracts they are signatories/observers of |
-| **Audit trail** | Every contract creation and archival is recorded on the Canton ledger with full provenance |
-
-### 9.2 Operator Controls
-
-| Risk | Mitigation |
-|---|---|
-| **NAV manipulation** | Only operator can update NAV; backend reads directly from EVM contracts (no manual input) |
-| **Unauthorized minting** | Minting requires a DepositOffer signed by the depositor — operator cannot self-mint |
-| **Fund extraction** | Withdrawal requires a WithdrawRequest signed by the holder — operator cannot unilaterally burn |
-| **Emergency** | `PauseVault` choice halts all operations immediately |
-| **Operator key compromise** | Future: multi-party `VaultPolicy` with quorum threshold for critical operations |
-
-### 9.3 EVM Security
+### 10.1 Canton Security
 
 | Control | Implementation |
 |---|---|
-| **Operator decentralization** | 16 Ditto operators across Eigenlayer and Symbiotic secure all vault transactions |
-| **Strategy constraints** | Vault allocator restricts deposits to whitelisted protocols (Aave, Morpho, Fluid, Spark) |
-| **Autonomous execution** | Yield generation runs autonomously — no manual intervention required |
-| **TVL backing** | $200M+ in TVL across the operator set provides economic security |
+| **CIP-56 authorization** | All BurnMintFactory operations require operator's `actAs` authority |
+| **Atomic execution** | Multi-command submissions are all-or-nothing |
+| **Privacy** | Canton's sub-transaction privacy ensures parties see only their own contracts |
+| **Audit trail** | Every token creation and archival recorded on the Canton ledger |
+| **UTXO integrity** | Holdings can only be consumed by authorized exercises |
 
-### 9.4 Controls Against Non-Bona-Fide Transactions
+### 10.2 Application Security
 
-Per Canton Featured App requirements:
+| Control | Implementation |
+|---|---|
+| **JWT authentication** | bcryptjs password hashing, signed JWT tokens |
+| **Role-based access** | `user` and `admin` roles with middleware enforcement |
+| **DB rollback** | Custodial transfers revert DB debit if on-chain operation fails |
+| **Pause mechanism** | Operator can pause all vault operations instantly |
+| **Input validation** | Decimal precision capped at 10 digits (Canton Numeric limit) |
+| **Configurable tokens** | Only operator-whitelisted tokens accepted for deposits |
 
-- Every CIP-56 operation (deposit, withdrawal, claim, transfer, LP swap) serves a genuine economic purpose
-- Operator-gated acceptance prevents wash trading
-- NAV oracle is read-only from EVM — no artificial inflation
-- Transfer rules enforce credential validation
-- All contracts have explicit signatory/observer authorization — no anonymous operations
+### 10.3 Custodial Integrity
+
+The treasury balance invariant: on-chain treasury dvUSDC = Σ(custodial users' `custodial_dvusdcx`). Maintained by:
+
+- Crediting DB balance only after confirmed on-chain mint to treasury
+- Debiting DB balance before on-chain transfer, with rollback on failure
+- Direct share deposits (deposit-shares) credit DB only after confirmed on-chain transfer
+
+### 10.4 EVM Security
+
+| Control | Implementation |
+|---|---|
+| **Operator decentralization** | 16 operators across Eigenlayer and Symbiotic |
+| **Strategy constraints** | Whitelisted protocols only (Aave, Morpho, Fluid, Spark) |
+| **Autonomous execution** | No manual intervention, guard-rail protected |
+| **Economic security** | $200M+ TVL backing across the operator set |
 
 ---
 
-## 10. Deployment Architecture
+## 11. Deployment Architecture
 
-### 10.1 Infrastructure
+### 11.1 Infrastructure
 
 ```mermaid
 flowchart TB
-    subgraph Participant["Canton Participant Node"]
-        DE["Daml Engine\n.dar files"]
-        LA["JSON Ledger API\n(gRPC, Port 5001)"]
-        DE --- LA
+    subgraph Validator["Splice Validator Node"]
+        P["Participant\nJSON Ledger API"]
+        V["Validator"]
+        W["Wallet Web UI"]
     end
 
-    subgraph Backend["Backend Services (Kubernetes / VM)"]
-        subgraph Bots["Service Layer"]
-            LB["Lifecycle Bot"]
-            NO["NAV Oracle"]
-            UM["UTXO Manager"]
-            MM["LP Market Maker"]
+    subgraph AppServer["Application Server (Docker)"]
+        subgraph Container["ditto-vault Container"]
+            API["Express.js API\nPort 3434"]
+            REACT["React App (/app)"]
+            DEMO["Controller (/demo)"]
         end
-        AG["API Gateway\n(REST → gRPC)"]
+        PG["PostgreSQL\n(Managed)"]
     end
 
-    subgraph Frontend["Frontend (React, Vercel)"]
-        UI["Web App\nOAuth2 via Canton Identity"]
-    end
+    P <-->|"SSH Tunnel\nor Direct"| API
+    API <--> PG
+    API --- REACT
+    API --- DEMO
 
-    LA <--> Bots
-    LA <--> AG
-    AG <--> UI
+    style Validator fill:#0d1117,stroke:#7ae99d,color:#fff
+    style AppServer fill:#0d1117,stroke:#4dabf7,color:#fff
 ```
 
-### 10.2 Deployment Sequence
+### 11.2 Docker Deployment
 
-```mermaid
-flowchart TD
-    subgraph DevNet["Phase 1 — DevNet"]
-        D1["daml build\ncompile .dar"] --> D2["Upload .dar to\nDevNet participant"]
-        D2 --> D3["Register dvUSDC\nAllocationFactory + TransferRule"]
-        D3 --> D4["Deploy backend\n→ DevNet Ledger API"]
-        D4 --> D5["Deploy frontend\nto Vercel"]
-        D5 --> D6["Initialize VaultState\nNAV=0, totalShares=0"]
-    end
+The application runs as a Docker container with `restart: unless-stopped`:
 
-    subgraph MainNet["Phase 3 — MainNet"]
-        M1["Security audit\nof Daml contracts"] --> M2["Upload audited .dar\nto MainNet participant"]
-        M2 --> M3["Re-register dvUSDC\nin MainNet Registry"]
-        M3 --> M4["Migrate backend to\nproduction infra"]
-        M4 --> M5["Apply for FeaturedAppRight\nfrom Tokenomics Committee"]
-        M5 --> M6["Configure AppRewardConfiguration\nfor activity markers"]
-    end
+- **Image**: `node:20-slim` + python3 (for DAR manifest parsing)
+- **Network**: Host mode (direct access to Canton Ledger API)
+- **Volumes**: DAR files mounted read-only, persistent data directory
+- **Database**: External PostgreSQL (managed service)
 
-    DevNet --> MainNet
-```
+### 11.3 Canton Connectivity
 
-### 10.3 Contract Packages
+Two authentication modes for connecting to the Canton Ledger API:
+
+| Environment | Auth Mode | Connection |
+|---|---|---|
+| Development | `none` (unsafe) | Direct or SSH tunnel to validator |
+| Production | `keycloak` | OAuth2 tokens from Keycloak IdP |
+
+### 11.4 Contract Packages
 
 ```
 ditto-vault-contracts/
-├── daml.yaml
-├── daml/
-│   ├── DittoVault/
-│   │   ├── VaultState.daml
-│   │   ├── DepositOffer.daml
-│   │   ├── WithdrawRequest.daml
-│   │   ├── YieldClaim.daml
-│   │   └── LiquidityPool.daml
-│   └── Test/
-│       ├── VaultStateTest.daml
-│       ├── DepositFlowTest.daml
-│       ├── WithdrawFlowTest.daml
-│       └── YieldClaimTest.daml
-└── .dar (compiled output)
+├── daml.yaml                     # sdk-version: 3.4.10
+├── dars/                         # CIP-56 data dependencies
+│   ├── splice-api-token-metadata-v1-1.0.0.dar
+│   ├── splice-api-token-holding-v1-1.0.0.dar
+│   └── splice-api-token-burn-mint-v1-1.0.0.dar
+└── daml/
+    └── DittoVault/
+        ├── DvUsdcToken.daml      # dvUSDC Holding + BurnMintFactory (CIP-56)
+        └── UsdcxToken.daml       # USDCx Holding + BurnMintFactory (CIP-56)
 ```
+
+The DAR is uploaded automatically on server startup. Package IDs are extracted from the DAR manifest.
 
 ---
 
-## 11. Why Ditto?
+## 12. Why Ditto?
 
 Ditto Network provides the infrastructure backbone that makes autonomous yield generation on Canton possible — without relying on centralized intermediaries or manual treasury operations.
 
@@ -812,7 +697,7 @@ Canton participants interacting with Ditto Vault benefit from institutional-grad
 
 ---
 
-## 12. References
+## 13. References
 
 | Resource | Link |
 |---|---|
