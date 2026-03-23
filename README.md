@@ -37,10 +37,6 @@ Canton Network                                EVM Yield Engine
 │  Express.js Backend (API + Auth) │
 │  ├── React App        (/app)    │  ← User dashboard
 │  └── Controller       (/demo)   │  ← Operator interface (admin login)
-│                                   │
-│  Nginx Reverse Proxy + Cloudflare │
-│  ├── ccvault.dittonetwork.io     │  ← Users (blocks operator APIs)
-│  └── ccvault-admin.dittonetwork.io│ ← Operators (full access)
 └───────────────────────────────────┘
 ```
 
@@ -114,13 +110,13 @@ Users register through the application and receive a deposit memo containing the
 | User Auth | JWT (bcryptjs + jsonwebtoken) |
 | Frontend (App) | React, Vite, TypeScript, Tailwind CSS, shadcn/ui |
 | Frontend (Controller) | Vanilla HTML/JS + Tailwind CSS |
-| Deployment | Docker Compose, Nginx, Cloudflare SSL |
+| Deployment | Docker Compose |
 
 ---
 
 ## User Interface
 
-### User Dashboard (`/app`) — [ccvault.dittonetwork.io](https://ccvault.dittonetwork.io)
+### User Dashboard (`/app`)
 
 - **Deposit USDCx** — modal with vault address and memo for depositing stablecoins
 - **Deposit Shares** — modal with treasury address and user ID for receiving dvUSDC
@@ -129,7 +125,7 @@ Users register through the application and receive a deposit memo containing the
 - Balance cards showing dvUSDC holdings, share value, and pending items
 - Vault statistics (NAV, total shares, share price)
 
-### Controller Dashboard (`/demo`) — [ccvault-admin.dittonetwork.io](https://ccvault-admin.dittonetwork.io)
+### Controller Dashboard (`/demo`)
 
 - **Admin login required** — full-screen authentication gate, JWT-based
 - Operator and test-user send forms with intelligent routing
@@ -148,7 +144,7 @@ Users register through the application and receive a deposit memo containing the
 4. **Configurable deposit tokens** — Operator can add/remove accepted tokens via the database, enabling seamless migration from test tokens to production stablecoins.
 5. **Atomic CIP-56 operations** — Multi-command submissions ensure all-or-nothing execution for token operations.
 6. **Single operator party** — The operator acts as both vault manager and CIP-56 token admin, simplifying authorization for atomic transactions.
-7. **Defense in depth** — All operator endpoints require admin JWT authentication. The controller dashboard enforces a login gate. Nginx reverse proxy provides domain-level route filtering, blocking operator APIs from the user-facing domain entirely.
+7. **Defense in depth** — All operator endpoints require admin JWT authentication. The controller dashboard enforces a login gate. A reverse proxy provides domain-level route filtering, isolating operator APIs from the user-facing surface.
 
 ---
 
@@ -225,16 +221,11 @@ All operator and controller API endpoints require JWT authentication with admin 
 
 ### Controller Dashboard
 
-The operator controller requires admin authentication via a login gate. JWT tokens are stored in session storage (cleared on tab close). All dashboard API calls include authorization headers, and expired/invalid tokens trigger automatic re-authentication.
+The operator controller requires admin authentication via a login gate. All dashboard API calls include authorization headers, and expired or invalid tokens trigger automatic re-authentication.
 
-### Domain-Level Route Filtering
+### Network Isolation
 
-An Nginx reverse proxy enforces domain-based access control:
-
-- **ccvault.dittonetwork.io** (user-facing) — serves the React app and proxies only public and user API endpoints. Operator endpoints and the controller dashboard return 404.
-- **ccvault-admin.dittonetwork.io** (operator-facing) — proxies all endpoints. Server-side JWT middleware enforces admin authorization.
-
-Both domains use Cloudflare for client-facing SSL and DDoS protection.
+User-facing and operator-facing surfaces are served on separate domains with reverse proxy route filtering. Operator APIs and the controller dashboard are not reachable from the user-facing domain.
 
 ### Custodial Integrity
 

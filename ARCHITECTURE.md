@@ -578,10 +578,10 @@ The controller dashboard implements intelligent routing for token sends:
 | Control | Implementation |
 |---|---|
 | **JWT authentication** | bcryptjs password hashing, signed JWT tokens |
-| **Role-based access** | `user` and `admin` roles with `requireAuth` / `requireAdmin` middleware |
+| **Role-based access** | `user` and `admin` roles with middleware enforcement |
 | **Operator endpoint protection** | All operator APIs (state, clearing, NAV, pause, bridge, transfers, token config) require admin JWT |
 | **Controller login gate** | Full-screen auth overlay on operator dashboard, session-scoped JWT, auto-logout on expiry |
-| **Domain-level filtering** | Nginx blocks operator APIs and `/demo` on the user-facing domain, returning 404 |
+| **Domain-level filtering** | Reverse proxy blocks operator APIs on the user-facing domain |
 | **DB rollback** | Custodial transfers revert DB debit if on-chain operation fails |
 | **Pause mechanism** | Operator can pause all vault operations instantly |
 | **Input validation** | Decimal precision capped at 10 digits (Canton Numeric limit) |
@@ -612,15 +612,13 @@ The treasury balance invariant: on-chain treasury dvUSDC = Σ(custodial users' `
 
 ```mermaid
 flowchart TB
-    subgraph CF["Cloudflare (SSL + CDN)"]
-        UD["ccvault.dittonetwork.io\n(User Domain)"]
-        AD["ccvault-admin.dittonetwork.io\n(Admin Domain)"]
+    subgraph Edge["Reverse Proxy + SSL"]
+        UD["User Domain"]
+        AD["Admin Domain"]
     end
 
-    subgraph AppServer["Application Server"]
-        NGX["Nginx Reverse Proxy\nRoute filtering per domain"]
-
-        subgraph Container["ditto-vault Container (Docker)"]
+    subgraph AppServer["Application Server (Docker)"]
+        subgraph Container["ditto-vault Container"]
             API["Express.js API\nPort 3434"]
             REACT["React App (/app)"]
             DEMO["Controller (/demo)\nAdmin login gate"]
@@ -633,15 +631,14 @@ flowchart TB
         V["Validator"]
     end
 
-    UD --> NGX
-    AD --> NGX
-    NGX --> API
+    UD --> API
+    AD --> API
     API <--> PG
     API --- REACT
     API --- DEMO
-    P <-->|"SSH Tunnel"| API
+    P <-->|"Secure Channel"| API
 
-    style CF fill:#0d1117,stroke:#ffb84d,color:#fff
+    style Edge fill:#0d1117,stroke:#ffb84d,color:#fff
     style Validator fill:#0d1117,stroke:#7ae99d,color:#fff
     style AppServer fill:#0d1117,stroke:#4dabf7,color:#fff
 ```
@@ -655,16 +652,14 @@ The application runs as a Docker container with `restart: unless-stopped`:
 - **Volumes**: DAR files mounted read-only, persistent data directory
 - **Database**: External PostgreSQL (managed service)
 
-### 11.3 Nginx Reverse Proxy
+### 11.3 Network Isolation
 
-Nginx provides domain-based routing and access control in front of the Express backend:
+User-facing and operator-facing interfaces are served on separate domains behind a reverse proxy:
 
-| Domain | Serves | Blocks |
-|---|---|---|
-| `ccvault.dittonetwork.io` | `/app`, public APIs, user APIs, `GET /api/deposit-tokens` | `/demo`, all operator APIs |
-| `ccvault-admin.dittonetwork.io` | `/demo`, `/app`, all `/api/` endpoints | Nothing (admin JWT middleware enforces auth) |
+- **User domain** — serves the React app and proxies only public and user-scoped API endpoints. Operator APIs and the controller dashboard are not reachable.
+- **Admin domain** — proxies all endpoints. Server-side JWT middleware enforces admin authorization on operator routes.
 
-SSL termination uses Cloudflare in "Full" mode with a self-signed origin certificate on the server. Client-facing encryption is handled entirely by Cloudflare's edge.
+SSL is terminated at the edge with encrypted origin connections.
 
 ### 11.4 Canton Connectivity
 
