@@ -35,8 +35,12 @@ Canton Network                                EVM Yield Engine
 │  └── supported_deposit_tokens    │  ← Configurable tokens
 │                                   │
 │  Express.js Backend (API + Auth) │
-│  ├── React App        (/app)    │  ← User-facing UI
-│  └── Controller       (/demo)   │  ← Operator interface
+│  ├── React App        (/app)    │  ← User dashboard
+│  └── Controller       (/demo)   │  ← Operator interface (admin login)
+│                                   │
+│  Nginx Reverse Proxy + Cloudflare │
+│  ├── ccvault.dittonetwork.io     │  ← Users (blocks operator APIs)
+│  └── ccvault-admin.dittonetwork.io│ ← Operators (full access)
 └───────────────────────────────────┘
 ```
 
@@ -110,13 +114,13 @@ Users register through the application and receive a deposit memo containing the
 | User Auth | JWT (bcryptjs + jsonwebtoken) |
 | Frontend (App) | React, Vite, TypeScript, Tailwind CSS, shadcn/ui |
 | Frontend (Controller) | Vanilla HTML/JS + Tailwind CSS |
-| Deployment | Docker Compose |
+| Deployment | Docker Compose, Nginx, Cloudflare SSL |
 
 ---
 
 ## User Interface
 
-### User Dashboard (`/app`)
+### User Dashboard (`/app`) — [ccvault.dittonetwork.io](https://ccvault.dittonetwork.io)
 
 - **Deposit USDCx** — modal with vault address and memo for depositing stablecoins
 - **Deposit Shares** — modal with treasury address and user ID for receiving dvUSDC
@@ -125,8 +129,9 @@ Users register through the application and receive a deposit memo containing the
 - Balance cards showing dvUSDC holdings, share value, and pending items
 - Vault statistics (NAV, total shares, share price)
 
-### Controller Dashboard (`/demo`)
+### Controller Dashboard (`/demo`) — [ccvault-admin.dittonetwork.io](https://ccvault-admin.dittonetwork.io)
 
+- **Admin login required** — full-screen authentication gate, JWT-based
 - Operator and test-user send forms with intelligent routing
 - Queue management (view/clear pending deposits and withdrawals)
 - Vault controls (fund reserve, bridge to/from EVM, update NAV, pause)
@@ -143,6 +148,7 @@ Users register through the application and receive a deposit memo containing the
 4. **Configurable deposit tokens** — Operator can add/remove accepted tokens via the database, enabling seamless migration from test tokens to production stablecoins.
 5. **Atomic CIP-56 operations** — Multi-command submissions ensure all-or-nothing execution for token operations.
 6. **Single operator party** — The operator acts as both vault manager and CIP-56 token admin, simplifying authorization for atomic transactions.
+7. **Defense in depth** — All operator endpoints require admin JWT authentication. The controller dashboard enforces a login gate. Nginx reverse proxy provides domain-level route filtering, blocking operator APIs from the user-facing domain entirely.
 
 ---
 
@@ -174,21 +180,26 @@ Yield:       sharePrice increases as NAV grows from EVM yield
 
 | Method | Endpoint | Description |
 |---|---|---|
+| POST | `/api/auth/register` | Register (custodial or non-custodial) |
+| POST | `/api/auth/login` | Login, returns JWT |
 | POST | `/api/deposit` | Deposit stablecoins `{ senderPartyId, amount, memo }` |
 | POST | `/api/deposit-shares` | Deposit dvUSDC to custodial user `{ senderPartyId, amount, memo }` |
 | POST | `/api/withdraw` | Withdraw dvUSDC `{ senderPartyId, dvUsdcAmount, memo }` |
+| GET | `/api/deposit-tokens` | List supported deposit tokens (read-only) |
 
 ### User (JWT Required)
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/api/auth/register` | Register (custodial or non-custodial) |
-| POST | `/api/auth/login` | Login, returns JWT |
+| GET | `/api/auth/me` | Current user profile, balances, deposit memo |
 | GET | `/api/user/portfolio` | Balances, pending items, vault stats |
 | POST | `/api/user/transfer-shares` | Transfer dvUSDC to another wallet |
 | POST | `/api/user/custodial-withdraw` | Custodial withdrawal to destination |
+| POST | `/api/user/faucet` | Mint test USDCx (non-custodial, one-time) |
 
-### Operator
+### Operator (JWT + Admin Role Required)
+
+All operator endpoints require a valid JWT token with `role: admin`. Unauthorized requests receive 401/403.
 
 | Method | Endpoint | Description |
 |---|---|---|
@@ -197,6 +208,37 @@ Yield:       sharePrice increases as NAV grows from EVM yield
 | POST | `/api/process-withdrawals` | Clear pending withdrawals |
 | POST | `/api/update-nav` | Update NAV and share price |
 | POST | `/api/transfer` | Raw CIP-56 transfer between parties |
+| POST | `/api/fund-vault` | Designate USDCx as vault reserve |
+| POST | `/api/bridge-to-evm` | Record capital deployed to EVM |
+| POST | `/api/bridge-from-evm` | Record capital returned from EVM |
+| POST | `/api/pause` | Toggle vault pause/unpause |
+| POST | `/api/deposit-tokens` | Add supported deposit token |
+| DELETE | `/api/deposit-tokens/:id` | Remove supported deposit token |
+
+---
+
+## Security
+
+### Endpoint Protection
+
+All operator and controller API endpoints require JWT authentication with admin role. This covers vault state access, queue clearing, NAV updates, pause control, token transfers, bridge operations, and deposit token configuration. Public endpoints (deposit, withdraw, deposit-shares, deposit-tokens list) remain open for permissionless interaction.
+
+### Controller Dashboard
+
+The operator controller requires admin authentication via a login gate. JWT tokens are stored in session storage (cleared on tab close). All dashboard API calls include authorization headers, and expired/invalid tokens trigger automatic re-authentication.
+
+### Domain-Level Route Filtering
+
+An Nginx reverse proxy enforces domain-based access control:
+
+- **ccvault.dittonetwork.io** (user-facing) — serves the React app and proxies only public and user API endpoints. Operator endpoints and the controller dashboard return 404.
+- **ccvault-admin.dittonetwork.io** (operator-facing) — proxies all endpoints. Server-side JWT middleware enforces admin authorization.
+
+Both domains use Cloudflare for client-facing SSL and DDoS protection.
+
+### Custodial Integrity
+
+The treasury balance invariant (on-chain treasury dvUSDC = sum of custodial users' DB balances) is maintained by crediting/debiting the database atomically with on-chain CIP-56 operations. DB rollback protects against partial failures.
 
 ---
 

@@ -578,7 +578,10 @@ The controller dashboard implements intelligent routing for token sends:
 | Control | Implementation |
 |---|---|
 | **JWT authentication** | bcryptjs password hashing, signed JWT tokens |
-| **Role-based access** | `user` and `admin` roles with middleware enforcement |
+| **Role-based access** | `user` and `admin` roles with `requireAuth` / `requireAdmin` middleware |
+| **Operator endpoint protection** | All operator APIs (state, clearing, NAV, pause, bridge, transfers, token config) require admin JWT |
+| **Controller login gate** | Full-screen auth overlay on operator dashboard, session-scoped JWT, auto-logout on expiry |
+| **Domain-level filtering** | Nginx blocks operator APIs and `/demo` on the user-facing domain, returning 404 |
 | **DB rollback** | Custodial transfers revert DB debit if on-chain operation fails |
 | **Pause mechanism** | Operator can pause all vault operations instantly |
 | **Input validation** | Decimal precision capped at 10 digits (Canton Numeric limit) |
@@ -609,26 +612,36 @@ The treasury balance invariant: on-chain treasury dvUSDC = Σ(custodial users' `
 
 ```mermaid
 flowchart TB
-    subgraph Validator["Splice Validator Node"]
-        P["Participant\nJSON Ledger API"]
-        V["Validator"]
-        W["Wallet Web UI"]
+    subgraph CF["Cloudflare (SSL + CDN)"]
+        UD["ccvault.dittonetwork.io\n(User Domain)"]
+        AD["ccvault-admin.dittonetwork.io\n(Admin Domain)"]
     end
 
-    subgraph AppServer["Application Server (Docker)"]
-        subgraph Container["ditto-vault Container"]
+    subgraph AppServer["Application Server"]
+        NGX["Nginx Reverse Proxy\nRoute filtering per domain"]
+
+        subgraph Container["ditto-vault Container (Docker)"]
             API["Express.js API\nPort 3434"]
             REACT["React App (/app)"]
-            DEMO["Controller (/demo)"]
+            DEMO["Controller (/demo)\nAdmin login gate"]
         end
         PG["PostgreSQL\n(Managed)"]
     end
 
-    P <-->|"SSH Tunnel\nor Direct"| API
+    subgraph Validator["Splice Validator Node"]
+        P["Participant\nJSON Ledger API"]
+        V["Validator"]
+    end
+
+    UD --> NGX
+    AD --> NGX
+    NGX --> API
     API <--> PG
     API --- REACT
     API --- DEMO
+    P <-->|"SSH Tunnel"| API
 
+    style CF fill:#0d1117,stroke:#ffb84d,color:#fff
     style Validator fill:#0d1117,stroke:#7ae99d,color:#fff
     style AppServer fill:#0d1117,stroke:#4dabf7,color:#fff
 ```
@@ -642,7 +655,18 @@ The application runs as a Docker container with `restart: unless-stopped`:
 - **Volumes**: DAR files mounted read-only, persistent data directory
 - **Database**: External PostgreSQL (managed service)
 
-### 11.3 Canton Connectivity
+### 11.3 Nginx Reverse Proxy
+
+Nginx provides domain-based routing and access control in front of the Express backend:
+
+| Domain | Serves | Blocks |
+|---|---|---|
+| `ccvault.dittonetwork.io` | `/app`, public APIs, user APIs, `GET /api/deposit-tokens` | `/demo`, all operator APIs |
+| `ccvault-admin.dittonetwork.io` | `/demo`, `/app`, all `/api/` endpoints | Nothing (admin JWT middleware enforces auth) |
+
+SSL termination uses Cloudflare in "Full" mode with a self-signed origin certificate on the server. Client-facing encryption is handled entirely by Cloudflare's edge.
+
+### 11.4 Canton Connectivity
 
 Two authentication modes for connecting to the Canton Ledger API:
 
@@ -651,7 +675,7 @@ Two authentication modes for connecting to the Canton Ledger API:
 | Development | `none` (unsafe) | Direct or SSH tunnel to validator |
 | Production | `keycloak` | OAuth2 tokens from Keycloak IdP |
 
-### 11.4 Contract Packages
+### 11.5 Contract Packages
 
 ```
 ditto-vault-contracts/
