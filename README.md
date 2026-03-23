@@ -14,30 +14,38 @@ The vault operates with a hybrid on-chain/off-chain architecture: **CIP-56 token
 
 ## Architecture
 
-```
-Canton Network                                EVM Yield Engine
-┌───────────────────────────────────┐         ┌──────────────────┐
-│  Splice Validator Node            │         │  Aave · Morpho   │
-│  ├── Participant (Ledger API)     │         │  Fluid · Spark   │
-│  └── CIP-56 Token Contracts      │  Bridge │  (16 operators)  │
-│      ├── dvUSDC Holdings/Factory  │ ◄─────► │                  │
-│      └── USDCx Holdings/Factory   │         └──────────────────┘
-└────────────┬──────────────────────┘
-             │ JSON Ledger API v2
-┌────────────┴──────────────────────┐
-│  Application Server               │
-│                                   │
-│  PostgreSQL (Off-Chain State)     │
-│  ├── vault_state (singleton)     │  ← NAV, shares, price
-│  ├── deposit_queue               │  ← Pending deposits
-│  ├── withdrawal_queue            │  ← Pending withdrawals
-│  ├── users                       │  ← Auth, custodial balances
-│  └── supported_deposit_tokens    │  ← Configurable tokens
-│                                   │
-│  Express.js Backend (API + Auth) │
-│  ├── React App        (/app)    │  ← User dashboard
-│  └── Controller       (/demo)   │  ← Operator interface (admin login)
-└───────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Canton["Canton Network"]
+        P["Splice Validator Node\nParticipant · Ledger API"]
+        DV["dvUSDC\nHolding + BurnMintFactory"]
+        UX["USDCx\nHolding + BurnMintFactory"]
+        P --- DV
+        P --- UX
+    end
+
+    subgraph App["Application Server"]
+        BE["Express.js Backend\nAPI + Auth"]
+        DB["PostgreSQL\nvault_state · queues · users\nsupported_deposit_tokens"]
+        UI["React App · Controller"]
+        BE <--> DB
+        BE --- UI
+    end
+
+    subgraph EVM["EVM Yield Engine"]
+        direction LR
+        Aave
+        Morpho
+        Fluid
+        Spark
+    end
+
+    Canton <-->|"JSON Ledger API v2"| BE
+    BE <-->|"NAV Oracle · Bridge"| EVM
+
+    style Canton fill:#0d1117,stroke:#7ae99d,color:#fff
+    style App fill:#0d1117,stroke:#4dabf7,color:#fff
+    style EVM fill:#0d1117,stroke:#ffb84d,color:#fff
 ```
 
 ---
@@ -63,10 +71,26 @@ All deposits and withdrawals use a self-describing memo: `{targetPartyId} {optio
 
 Any Canton party sends supported stablecoins to the operator address with a memo specifying where to mint dvUSDC shares.
 
-1. Sender transfers USDCx to operator (CIP-56 burn/mint on-chain)
-2. Backend queues the deposit in PostgreSQL with the parsed mint target
-3. Operator clears the queue: CIP-56 mints dvUSDC to the target address, updates vault state in DB
-4. If the target is the treasury (custodial), the user's DB balance is credited automatically
+```mermaid
+sequenceDiagram
+    actor User
+    participant BE as Backend
+    participant DB as PostgreSQL
+    participant CN as Canton (CIP-56)
+
+    User->>BE: Deposit USDCx with memo
+    BE->>CN: Transfer USDCx to operator (burn/mint)
+    BE->>DB: Queue deposit with parsed mint target
+    BE-->>User: Queued
+
+    Note over BE: Operator clears queue
+    BE->>CN: Mint dvUSDC to mint target
+    BE->>DB: Update vault state (NAV, shares)
+
+    alt Target is treasury (custodial)
+        BE->>DB: Credit user's custodial balance
+    end
+```
 
 ### Deposit Shares → Custodial Account
 
@@ -76,9 +100,22 @@ Anyone can send dvUSDC directly to a custodial user's account by transferring sh
 
 Any Canton party sends dvUSDC to the operator address with a memo specifying where to send USDCx redemption.
 
-1. Sender transfers dvUSDC to operator (CIP-56 burn/mint on-chain)
-2. Backend queues the withdrawal in PostgreSQL
-3. Operator clears the queue: burns dvUSDC, transfers USDCx to the target, updates vault state
+```mermaid
+sequenceDiagram
+    actor User
+    participant BE as Backend
+    participant DB as PostgreSQL
+    participant CN as Canton (CIP-56)
+
+    User->>BE: Withdraw dvUSDC with memo
+    BE->>CN: Transfer dvUSDC to operator (burn/mint)
+    BE->>DB: Queue withdrawal with payout target
+    BE-->>User: Queued
+
+    Note over BE: Operator clears queue
+    BE->>CN: Burn dvUSDC + transfer USDCx to target
+    BE->>DB: Update vault state (NAV, shares)
+```
 
 ### Transfer Shares
 
