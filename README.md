@@ -104,13 +104,18 @@ sequenceDiagram
     BE->>DB: Update vault state (NAV, shares)
 
     alt Target is treasury (custodial)
-        BE->>DB: Credit user's custodial dvUSDCx balance
+        BE->>DB: Direct credit user's custodial dvUSDCx balance
     end
 ```
 
 ### Deposit to Custodial Account
 
-Custodial users receive a treasury address and their user UUID. Anyone can send USDCx or dvUSDCx to the treasury with the UUID as memo. The transaction indexer detects the incoming tokens and credits the user's custodial balance immediately — no queue needed for direct treasury deposits.
+Custodial users receive a treasury address and their user UUID as their deposit credentials. Two deposit paths are supported:
+
+- **Via the deposit API** — calling `POST /api/deposit` with the user's UUID as memo transfers tokens to the treasury on-chain and credits the custodial balance immediately. On-chain memo metadata enables crash recovery, and a dedup record prevents double-crediting by the indexer.
+- **Via external wallet** — anyone can send USDCx or dvUSDCx directly to the treasury with the UUID as memo. The transaction indexer detects the incoming tokens and credits the user's custodial balance automatically.
+
+Both paths credit immediately — no queue or clearing needed for direct custodial deposits.
 
 ### Withdraw dvUSDC → Get USDCx
 
@@ -137,10 +142,10 @@ sequenceDiagram
 
 Custodial users can convert between USDCx and dvUSDCx within their custody:
 
-- **Mint dvUSDCx** — converts custodial USDCx to vault shares. Backend transfers USDCx from treasury to operator, enters the deposit queue, and after clearing, credits custodial dvUSDCx.
-- **Burn dvUSDCx** — converts vault shares back to USDCx. Backend transfers dvUSDCx from treasury to operator, enters the withdrawal queue, and after clearing, credits custodial USDCx.
+- **Mint dvUSDCx** — converts custodial USDCx to vault shares. Backend transfers USDCx from treasury to operator, enters the deposit queue, and on clearing, the clearing code directly credits custodial dvUSDCx in the database.
+- **Burn dvUSDCx** — converts vault shares back to USDCx. Backend transfers dvUSDCx from treasury to operator, enters the withdrawal queue, and on clearing, the clearing code directly credits custodial USDCx in the database.
 
-Both flows use the standard deposit/withdrawal pipeline with the treasury as sender.
+Both flows reuse the standard deposit/withdrawal pipeline with the treasury as sender. Custodial crediting happens inline during clearing — no indexer dependency for the happy path.
 
 ### Transfer Shares
 
@@ -188,12 +193,13 @@ Users register through the application and receive a deposit memo containing the
 
 ### User Dashboard (`/app`)
 
-- **Deposit Info Card** — always-visible deposit address and memo for USDCx and dvUSDCx
-- **Custodial Actions** — 2x2 grid: Mint dvUSDCx, Burn dvUSDCx, Withdraw USDCx, Withdraw dvUSDCx
-- **Non-Custodial Actions** — Withdraw dvUSDCx, Send dvUSDCx
-- Balance cards showing USDCx, dvUSDCx holdings, share value, and total portfolio value
+- **Portfolio header** with donut chart, total value, and Deposit button
+- **Asset rows** — each token (USDCx, dvUSDCx) shown as a row with balance, portfolio percentage, and inline action buttons
+- **Custodial actions** — Mint/Send for USDCx, Burn/Send for dvUSDCx. Unified deposit dialog with treasury address + user memo.
+- **Non-custodial actions** — Redeem/Send for dvUSDCx. Deposit dialog with vault address + wallet memo.
 - Pending items (deposits and withdrawals in clearing queue)
 - Vault statistics (NAV, total shares, share price)
+- Network selector (DevNet, TestNet, MainNet) and DevNet disclaimer banner
 
 ### Controller Dashboard (`/demo`)
 
@@ -305,7 +311,12 @@ User-facing and operator-facing surfaces are served on separate domains with rev
 
 ### Custodial Integrity
 
-The treasury balance invariant (on-chain treasury dvUSDC ≥ sum of custodial users' DB balances) is maintained by crediting/debiting the database atomically with on-chain CIP-56 operations. DB rollback protects against partial failures. The transaction indexer uses PostgreSQL transactions with `processed_transactions` deduplication to prevent double-crediting.
+The treasury balance invariant (on-chain treasury tokens ≥ sum of custodial users' DB balances) is maintained through multiple defense layers:
+
+- **Custodial deposits** via the deposit API include on-chain memo metadata for crash recovery, plus a dedup record in `processed_transactions` to prevent indexer double-crediting.
+- **Clearing operations** directly credit custodial balances inline (DB UPDATE) when the target is the treasury party.
+- **Custodial withdrawals** debit the DB first, wrap the on-chain operation in a try-catch, and rollback the DB debit on chain failure.
+- **Transaction indexer** uses three dedup layers: treasury remainder skip (ExercisedEvent Archive detection), clearing dedup (check recent queue entries), and `processed_transactions` unique constraint.
 
 ---
 

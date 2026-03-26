@@ -436,7 +436,7 @@ sequenceDiagram
     BE->>DB: UPDATE deposit_queue SET status = 'cleared'
 
     alt mint_target is treasury
-        Note over BE: Indexer detects dvUSDCx arrival at treasury
+        Note over BE: Direct DB credit in clearing code
         BE->>DB: Credit custodial_dvusdcx by memo UUID
     end
 
@@ -478,31 +478,41 @@ sequenceDiagram
     BE->>DB: UPDATE withdrawal_queue SET status = 'cleared'
 
     alt payout_target is treasury
-        Note over BE: Indexer detects USDCx arrival at treasury
+        Note over BE: Direct DB credit in clearing code
         BE->>DB: Credit custodial_usdcx by memo UUID
     end
 
     BE-->>User: USDCx returned
 ```
 
-### 6.3 Custodial Deposit (External → Treasury)
+### 6.3 Custodial Deposit (Two Paths)
 
-External wallets send USDCx or dvUSDCx directly to the treasury with a user UUID as memo. The transaction indexer detects the arrival and credits the user's custodial balance.
+Custodial users can receive deposits through two paths:
+
+**Path A: Via `/api/deposit`** — The deposit API accepts a bare user UUID or `{treasuryPartyId} {userUUID}` as the memo. The backend detects the custodial user, transfers tokens to the treasury on-chain (with `dittonetwork.io/memo` metadata for crash recovery), and credits the user's DB balance immediately. A dedup record is written to `processed_transactions` so the indexer skips the same transaction.
+
+**Path B: Via external wallet** — Any wallet sends tokens directly to the treasury with the user's UUID as memo. The transaction indexer detects the arrival and credits the balance.
 
 ```mermaid
 sequenceDiagram
-    actor External as External Wallet
+    actor Sender
+    participant BE as Backend
     participant CN as Canton (CIP-56)
     participant IDX as Transaction Indexer
     participant DB as PostgreSQL
 
-    External->>CN: Transfer USDCx/dvUSDCx to treasury<br/>memo: {userUUID}
-    IDX->>CN: Poll /v2/updates
-    IDX->>IDX: Detect Holding create at treasury<br/>with dittonetwork.io/memo
-    IDX->>DB: BEGIN TRANSACTION
-    IDX->>DB: Credit custodial_usdcx or custodial_dvusdcx
-    IDX->>DB: INSERT processed_transaction
-    IDX->>DB: COMMIT
+    alt Path A: Via /api/deposit
+        Sender->>BE: POST /api/deposit { memo: userUUID }
+        BE->>CN: Transfer to treasury (with memo metadata)
+        BE->>DB: Credit custodial_usdcx or custodial_dvusdcx
+        BE->>DB: INSERT processed_transaction (dedup)
+        BE-->>Sender: { status: "credited" }
+    else Path B: External wallet
+        Sender->>CN: Transfer to treasury<br/>memo: {userUUID}
+        IDX->>CN: Poll /v2/updates
+        IDX->>IDX: Detect Holding at treasury
+        IDX->>DB: Credit custodial balance<br/>+ INSERT processed_transaction
+    end
 ```
 
 ### 6.4 Custodial Mint (USDCx → dvUSDCx)
@@ -531,9 +541,7 @@ sequenceDiagram
     Note over BE: Operator clears deposits
     BE->>CN: Mint dvUSDCx to treasury (with memo metadata)
     BE->>DB: Update vault_state
-
-    Note over IDX: Indexer detects dvUSDCx at treasury
-    IDX->>DB: Credit custodial_dvusdcx
+    BE->>DB: Direct credit custodial_dvusdcx<br/>(inline in clearing code)
 ```
 
 ### 6.5 Custodial Burn (dvUSDCx → USDCx)
@@ -562,9 +570,7 @@ sequenceDiagram
     Note over BE: Operator clears withdrawals
     BE->>CN: Burn dvUSDCx + mint USDCx to treasury (with memo metadata)
     BE->>DB: Update vault_state
-
-    Note over IDX: Indexer detects USDCx at treasury
-    IDX->>DB: Credit custodial_usdcx
+    BE->>DB: Direct credit custodial_usdcx<br/>(inline in clearing code)
 ```
 
 ### 6.6 Share Transfer
@@ -641,10 +647,10 @@ Custodial operations reuse the same deposit/withdrawal pipeline as non-custodial
 
 | Custodial Action | Under the Hood |
 |---|---|
-| Mint dvUSDCx | Treasury sends USDCx to operator (deposit queue) → operator clears → dvUSDCx minted to treasury → indexer credits user |
-| Burn dvUSDCx | Treasury sends dvUSDCx to operator (withdrawal queue) → operator clears → USDCx minted to treasury → indexer credits user |
-| Withdraw USDCx | Backend transfers USDCx from treasury to user's destination on-chain |
-| Withdraw dvUSDCx | Backend transfers dvUSDCx from treasury to user's destination on-chain |
+| Mint dvUSDCx | Treasury sends USDCx to operator (deposit queue) → operator clears → dvUSDCx minted to treasury → clearing code directly credits `custodial_dvusdcx` |
+| Burn dvUSDCx | Treasury sends dvUSDCx to operator (withdrawal queue) → operator clears → USDCx minted to treasury → clearing code directly credits `custodial_usdcx` |
+| Withdraw USDCx | Backend debits `custodial_usdcx`, transfers from treasury on-chain (DB rollback on chain failure) |
+| Withdraw dvUSDCx | Backend debits `custodial_dvusdcx`, transfers from treasury on-chain (DB rollback on chain failure) |
 
 ---
 
@@ -833,10 +839,11 @@ The `POST /api/registry/transfer-factory` endpoint provides external wallets wit
 
 The treasury balance invariant: on-chain treasury tokens ≥ Σ(custodial users' DB balances). Maintained by:
 
-- Crediting DB balance only after confirmed on-chain mint to treasury (via indexer)
-- Debiting DB balance before on-chain transfer, with rollback on failure
-- Direct share deposits (deposit-shares) credit DB only after confirmed on-chain transfer
-- Transaction indexer uses atomic PostgreSQL transactions for all credits
+- Deposit via `/api/deposit` with UUID memo: transfers to treasury on-chain first, then credits DB, then writes dedup record to `processed_transactions`. On-chain memo metadata enables crash recovery (indexer handles it on restart).
+- Clearing operations (`process-deposits`, `process-withdrawals`): when target is treasury, credits custodial balance inline with direct DB UPDATE.
+- Debiting DB balance before on-chain transfer, with inner try-catch rollback on chain failure (all custodial withdrawal endpoints).
+- Direct share deposits (`deposit-shares`) credit DB only after confirmed on-chain transfer to treasury.
+- Transaction indexer uses atomic PostgreSQL transactions for all credits. Three dedup layers prevent double-counting: (1) treasury remainder skip via ExercisedEvent Archive detection, (2) clearing dedup checking recent cleared queue entries, (3) `processed_transactions` unique tx_id constraint.
 
 ### 11.5 EVM Security
 
