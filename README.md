@@ -6,9 +6,9 @@
 
 ## Overview
 
-Ditto Vault bridges risk-adjusted yield from EVM DeFi to Canton Network through a CIP-56-compliant vault token (**dvUSDC**). Users deposit supported stablecoins on Canton and receive dvUSDC — a yield-bearing token backed by returns from leading DeFi money markets. Yield generation is fully autonomous and secured by Ditto Network's decentralized operator set of 16 operators across Eigenlayer and Symbiotic, securing over $200M in TVL.
+Ditto Vault brings risk-adjusted yield from EVM DeFi to Canton Network through a CIP-56-compliant vault token (**dvUSDCx**). Users deposit USDCx stablecoins and receive dvUSDCx — a yield-bearing share token backed by returns from leading DeFi money markets. Yield generation is fully autonomous and secured by Ditto Network's decentralized operator set of 16 operators across Eigenlayer and Symbiotic, securing over $200M in TVL.
 
-The vault operates with a hybrid on-chain/off-chain architecture: **CIP-56 token contracts** handle all token movements on Canton, while **PostgreSQL** manages vault accounting, deposit/withdrawal queues, and user state. This separation minimizes on-chain complexity and cost while preserving full CIP-56 compliance for token interoperability.
+All interactions are **non-custodial** — users hold their own tokens in their own Canton wallet. The vault operates with a hybrid on-chain/off-chain architecture: **CIP-56 token contracts** handle all token movements on Canton, while **PostgreSQL** manages vault accounting, deposit/withdrawal queues, and share price tracking. This separation minimizes on-chain complexity while preserving full CIP-56 compliance for token interoperability.
 
 ---
 
@@ -19,9 +19,11 @@ flowchart TB
     subgraph Canton["Canton Network"]
         P["Splice Validator Node\nParticipant · Ledger API"]
         ISS["ditto-vault-1 (Issuer)\nCIP-56 Token Admin"]
-        DV["dvUSDC\nHolding + BurnMintFactory"]
+        OP["ditto-vault-operator\nVault Operations"]
+        DV["dvUSDCx\nHolding + BurnMintFactory"]
         UX["USDCx\nHolding + BurnMintFactory"]
         P --- ISS
+        P --- OP
         ISS --- DV
         ISS --- UX
     end
@@ -29,7 +31,7 @@ flowchart TB
     subgraph App["Application Server"]
         BE["Express.js Backend\nAPI + Auth + Indexer"]
         DB["PostgreSQL\nvault_state · queues · users\nprocessed_transactions · indexer_state"]
-        UI["React App · Controller"]
+        UI["React App · Admin Dashboard"]
         BE <--> DB
         BE --- UI
     end
@@ -43,7 +45,7 @@ flowchart TB
     end
 
     Canton <-->|"JSON Ledger API v2"| BE
-    BE <-->|"NAV Oracle · Bridge"| EVM
+    BE <-->|"Yield Oracle · Bridge"| EVM
 
     style Canton fill:#0d1117,stroke:#7ae99d,color:#fff
     style App fill:#0d1117,stroke:#4dabf7,color:#fff
@@ -56,12 +58,12 @@ flowchart TB
 
 | Token | Purpose | Standard |
 |---|---|---|
-| **dvUSDC** | Vault share token — proportional ownership of vault NAV | CIP-56 Holding + BurnMintFactory |
+| **dvUSDCx** | Vault share token — proportional ownership of vault NAV | CIP-56 Holding + BurnMintFactory |
 | **USDCx** | Stablecoin — deposited by users, held by operator | CIP-56 Holding + BurnMintFactory |
 
 Both tokens implement the Splice CIP-56 token standard interfaces. Holdings follow the UTXO model — minting burns inputs and creates outputs. Factories are nonconsuming, allowing multiple mint/burn operations in a single atomic batch.
 
-**Party Separation (CIP-47 Compliant):** A dedicated issuer party (`ditto-vault-1`) signs all CIP-56 token contracts and holds the `FeaturedAppRight`. The operator party (`ditto-vault-operator`) manages vault operations only. This separation satisfies CIP-47 Rule 9 for Featured App Activity Marker eligibility.
+**Party Separation (CIP-47 Compliant):** A dedicated issuer party (`ditto-vault-1`) signs all CIP-56 token contracts. The operator party (`ditto-vault-operator`) manages vault operations. This separation satisfies CIP-47 Rule 9 for Featured App Activity Marker eligibility.
 
 **Metadata Passthrough:** The BurnMintFactory propagates `extraArgs.meta` into created Holdings, enabling on-chain memo tracking via a `dittonetwork.io/memo` key. This allows the transaction indexer to detect and route token movements automatically.
 
@@ -69,106 +71,82 @@ Both tokens implement the Splice CIP-56 token standard interfaces. Holdings foll
 
 ## Key Flows
 
-### Memo-Based Routing
+### Deposit USDCx → Receive dvUSDCx Shares
 
-All deposits and withdrawals use a self-describing memo: `{targetPartyId} {optionalMemo}`. The backend parses the target address and forwarding memo from this format. No Canton party registration is required for core deposit/withdraw functionality.
+Users send USDCx to the vault operator. The transaction indexer detects the incoming transfer and queues it. When the admin clears the queue, dvUSDCx shares are minted to the user at the current share price.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant BE as Backend
+    participant DB as PostgreSQL
+    participant CN as Canton (CIP-56)
+
+    User->>CN: Send USDCx to operator (with party ID memo)
+    CN-->>BE: Indexer detects incoming USDCx
+    BE->>DB: Queue deposit (pending)
+    Note over BE: Admin clears queue
+    BE->>CN: Mint dvUSDCx to user (BurnMint)
+    BE->>DB: Update vault state (NAV, shares, reserve)
+```
+
+### Redeem dvUSDCx → Receive USDCx
+
+Users send dvUSDCx back to the operator. The indexer queues it as a withdrawal. On clearing, the operator burns the dvUSDCx and sends USDCx back at the current share price.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant BE as Backend
+    participant DB as PostgreSQL
+    participant CN as Canton (CIP-56)
+
+    User->>CN: Send dvUSDCx to operator (with party ID memo)
+    CN-->>BE: Indexer detects incoming dvUSDCx
+    BE->>DB: Queue withdrawal (pending)
+    Note over BE: Admin clears queue
+    BE->>CN: Burn dvUSDCx + send USDCx to user
+    BE->>DB: Update vault state (NAV, shares, reserve)
+```
+
+### Transfer dvUSDCx
+
+Users can transfer dvUSDCx directly to any Canton party. This is a standard CIP-56 transfer with no backend involvement — it generates a 3rd-party transaction eligible for asset issuer markers.
 
 ### Transaction Indexer
 
-A background service polls Canton's `/v2/updates` endpoint every 10 seconds, watching for token movements to operator and treasury parties. Transactions carrying a `dittonetwork.io/memo` metadata key are automatically routed:
+A background service polls Canton's `/v2/updates` endpoint every 10 seconds, watching for token movements to the operator party. Transactions carrying a `dittonetwork.io/memo` metadata key are automatically routed:
 
-- **Tokens arriving at treasury** → credited to the custodial user identified by the memo (UUID)
-- **USDCx arriving at operator** → queued as a deposit with the memo-specified mint target
-- **dvUSDCx arriving at operator** → queued as a withdrawal with the memo-specified payout target
+- **USDCx arriving at operator** → queued as a deposit
+- **dvUSDCx arriving at operator** → queued as a withdrawal
 
-All indexer operations are crash-resilient via PostgreSQL-backed state tracking (`processed_transactions` + `indexer_state` tables).
-
-### Deposit USDCx → Get Shares
-
-Any Canton party sends supported stablecoins to the operator address with a memo specifying where to mint dvUSDC shares.
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant BE as Backend
-    participant DB as PostgreSQL
-    participant CN as Canton (CIP-56)
-
-    User->>BE: Deposit USDCx with memo
-    BE->>CN: Transfer USDCx to operator (burn/mint)
-    BE->>DB: Queue deposit with parsed mint target
-    BE-->>User: Queued
-
-    Note over BE: Operator clears queue
-    BE->>CN: Mint dvUSDC to mint target (with memo metadata)
-    BE->>DB: Update vault state (NAV, shares)
-
-    alt Target is treasury (custodial)
-        BE->>DB: Direct credit user's custodial dvUSDCx balance
-    end
-```
-
-### Deposit to Custodial Account
-
-Custodial users receive a treasury address and their user UUID as their deposit credentials. Two deposit paths are supported:
-
-- **Via the deposit API** — calling `POST /api/deposit` with the user's UUID as memo transfers tokens to the treasury on-chain and credits the custodial balance immediately. On-chain memo metadata enables crash recovery, and a dedup record prevents double-crediting by the indexer.
-- **Via external wallet** — anyone can send USDCx or dvUSDCx directly to the treasury with the UUID as memo. The transaction indexer detects the incoming tokens and credits the user's custodial balance automatically.
-
-Both paths credit immediately — no queue or clearing needed for direct custodial deposits.
-
-### Withdraw dvUSDC → Get USDCx
-
-Any Canton party sends dvUSDC to the operator address with a memo specifying where to send USDCx redemption.
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant BE as Backend
-    participant DB as PostgreSQL
-    participant CN as Canton (CIP-56)
-
-    User->>BE: Withdraw dvUSDC with memo
-    BE->>CN: Transfer dvUSDC to operator (burn/mint)
-    BE->>DB: Queue withdrawal with payout target
-    BE-->>User: Queued
-
-    Note over BE: Operator clears queue
-    BE->>CN: Burn dvUSDC + transfer USDCx to target (with memo metadata)
-    BE->>DB: Update vault state (NAV, shares)
-```
-
-### Custodial Mint & Burn
-
-Custodial users can convert between USDCx and dvUSDCx within their custody:
-
-- **Mint dvUSDCx** — converts custodial USDCx to vault shares. Backend transfers USDCx from treasury to operator, enters the deposit queue, and on clearing, the clearing code directly credits custodial dvUSDCx in the database.
-- **Burn dvUSDCx** — converts vault shares back to USDCx. Backend transfers dvUSDCx from treasury to operator, enters the withdrawal queue, and on clearing, the clearing code directly credits custodial USDCx in the database.
-
-Both flows reuse the standard deposit/withdrawal pipeline with the treasury as sender. Custodial crediting happens inline during clearing — no indexer dependency for the happy path.
-
-### Transfer Shares
-
-Authenticated users can transfer dvUSDC between wallets (custodial-to-custodial, custodial-to-non-custodial, or vice versa) through the application API.
+All indexer operations are crash-resilient via PostgreSQL-backed offset tracking and transaction deduplication.
 
 ---
 
-## Interaction Modes
+## Vault Accounting & Yield
 
-### Non-Custodial
+All vault state management happens in PostgreSQL:
 
-Users provide their own Canton party ID and interact permissionlessly. Shares are held directly by their party on-chain. No registration is required — the memo carries all routing information.
-
-### Custodial
-
-Users register through the application and receive a deposit memo containing the treasury address and their user ID. Both USDCx and dvUSDCx are tracked in PostgreSQL. Custodial users have four actions available:
-
-| Action | Description |
+| Field | Description |
 |---|---|
-| **Mint dvUSDCx** | Convert custodial USDCx into vault shares |
-| **Burn dvUSDCx** | Convert vault shares back into USDCx |
-| **Withdraw USDCx** | Send USDCx from custody to an external Canton wallet |
-| **Withdraw dvUSDCx** | Send dvUSDCx from custody to an external Canton wallet |
+| `nav` | Net Asset Value = `vault_reserve + evm_vault_balance` |
+| `total_shares` | Total dvUSDCx shares outstanding |
+| `share_price` | `nav / total_shares` — derived, never set manually |
+| `vault_reserve` | USDCx available for withdrawals on Canton |
+| `evm_vault_balance` | Capital deployed to EVM yield strategies |
+| `is_paused` | Emergency pause flag |
+
+**NAV is always derived** from the sum of vault reserve and EVM vault balance. It cannot be set to an arbitrary value.
+
+**How yield raises share price:**
+
+```
+1. Users deposit 1000 USDCx → reserve=1000, NAV=1000, 1000 shares at $1.00
+2. Operator bridges 800 to EVM → reserve=200, EVM=800, NAV=1000 (unchanged)
+3. EVM earns 100 yield → EVM=900, NAV=1100, share_price=$1.10
+4. User redeems 100 dvUSDCx → gets 110 USDCx (100 shares × $1.10)
+```
 
 ---
 
@@ -177,146 +155,50 @@ Users register through the application and receive a deposit memo containing the
 | Layer | Technology |
 |---|---|
 | Token Contracts | Daml 3.x / CIP-56 (Holding + BurnMintFactory interfaces) |
-| Network | Canton Network (Splice validator, DevNet + MainNet) |
+| Network | Canton Network (Splice validator, DevNet / MainNet) |
 | Ledger API | Canton JSON Ledger API v2 (HTTP) |
 | Backend | Node.js, TypeScript, Express |
 | Database | PostgreSQL |
 | Transaction Indexer | Background poller on `/v2/updates` with PostgreSQL state |
 | User Auth | JWT (bcryptjs + jsonwebtoken) |
-| Frontend (App) | React, Vite, TypeScript, Tailwind CSS, shadcn/ui |
-| Frontend (Controller) | Vanilla HTML/JS + Tailwind CSS |
+| Frontend (App) | React 19, Vite 7, TypeScript, Tailwind CSS v4, shadcn/ui |
+| Frontend (Admin) | Vanilla HTML/JS + Tailwind CSS |
+| Wallet Integration | Loop SDK (`@fivenorth/loop-sdk`) |
 | Deployment | Docker Compose |
 
 ---
 
 ## User Interface
 
-### User Dashboard (`/app`)
+### User App (`/app`)
 
-- **Portfolio header** with donut chart, total value, and Deposit button
-- **Asset rows** — each token (USDCx, dvUSDCx) shown as a row with balance, portfolio percentage, and inline action buttons
-- **Custodial actions** — Mint/Send for USDCx, Burn/Send for dvUSDCx. Unified deposit dialog with treasury address + user memo.
-- **Non-custodial actions** — Redeem/Send for dvUSDCx. Deposit dialog with vault address + wallet memo.
-- Pending items (deposits and withdrawals in clearing queue)
+- Account overview with Party ID and operator address
+- Portfolio cards: USDCx + dvUSDCx balances with Deposit, Redeem, and Send actions
+- Deposit/Redeem via backend API (registered users) or Loop wallet SDK (wallet users)
+- Pending deposits/withdrawals with status tracking
 - Vault statistics (NAV, total shares, share price)
-- Network selector (DevNet, TestNet, MainNet) and DevNet disclaimer banner
+- DevNet faucet for test tokens
 
-### Controller Dashboard (`/demo`)
+### Admin Dashboard (`/demo`)
 
-- **Admin login required** — full-screen authentication gate, JWT-based
-- Operator and test-user send forms with intelligent routing
-- Queue management (view/clear pending deposits and withdrawals)
-- Vault controls (fund reserve, bridge to/from EVM, update NAV, pause)
-- Configurable supported deposit tokens (USDCx + dvUSDCx by default)
-- All balances (on-chain + custodial DB, including custodial USDCx)
+- Operator authentication gate
+- Real-time vault metrics: NAV, Share Price, Total Shares, Vault Reserve, EVM Balance
+- Operator transfer form for raw CIP-56 transfers
+- Queue management: view and clear pending deposits/withdrawals
+- Vault controls: Add Yield, Fund Reserve, Bridge to/from EVM, Pause/Unpause
+- All user balances table with on-chain USDCx and dvUSDCx
 
 ---
 
 ## Design Principles
 
-1. **CIP-56 only on-chain** — Token Holdings and Factories are the sole on-chain contracts. Vault accounting lives in PostgreSQL, reducing Canton traffic cost and UTXO complexity.
-2. **Permissionless memo routing** — No registration needed. Deposit/withdrawal memos carry all routing information, enabling any Canton party to interact.
-3. **Custodial option** — Users who prefer a managed experience share a treasury party. Individual USDCx and dvUSDCx balances tracked off-chain with DB rollback protection on chain failures.
-4. **Configurable deposit tokens** — Operator can add/remove accepted tokens via the database, enabling seamless migration from test tokens to production stablecoins.
-5. **Atomic CIP-56 operations** — Multi-command submissions ensure all-or-nothing execution for token operations.
-6. **Separated issuer/operator parties** — `ditto-vault-1` (issuer) signs CIP-56 token contracts. `ditto-vault-operator` manages vault operations. Required by CIP-47 Rule 9 for Featured App marker eligibility.
-7. **Defense in depth** — All operator endpoints require admin JWT authentication. The controller dashboard enforces a login gate. A reverse proxy provides domain-level route filtering, isolating operator APIs from the user-facing surface.
-8. **Metadata passthrough** — BurnMintFactory propagates `extraArgs.meta` into Holdings, enabling the transaction indexer to detect and route token movements by reading on-chain metadata.
-
----
-
-## Vault Accounting
-
-All vault state management happens in PostgreSQL:
-
-| Field | Description |
-|---|---|
-| `nav` | Total vault value in USDC terms |
-| `total_shares` | Total dvUSDC shares outstanding |
-| `share_price` | `nav / total_shares` — updated on every deposit/withdrawal clearing |
-| `vault_reserve` | USDCx available for withdrawals |
-| `evm_vault_balance` | Capital deployed to EVM yield strategies |
-| `is_paused` | Emergency pause flag — blocks all operations |
-
-**Share price calculation:**
-```
-On deposit:  sharesToMint    = depositAmount / sharePrice
-On withdraw: redemptionAmount = sharesToBurn × sharePrice
-Yield:       sharePrice increases as NAV grows from EVM yield
-```
-
----
-
-## API
-
-### Public (No Authentication)
-
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/auth/register` | Register (custodial or non-custodial) |
-| POST | `/api/auth/login` | Login, returns JWT |
-| POST | `/api/deposit` | Deposit stablecoins `{ senderPartyId, amount, memo, tokenType? }` |
-| POST | `/api/deposit-shares` | Deposit dvUSDC to custodial user `{ senderPartyId, amount, memo }` |
-| POST | `/api/withdraw` | Withdraw dvUSDC `{ senderPartyId, dvUsdcAmount, memo }` |
-| GET | `/api/deposit-tokens` | List supported deposit tokens (read-only) |
-| POST | `/api/registry/transfer-factory` | Registry info for external wallets (factory IDs, memo format) |
-
-### User (JWT Required)
-
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/api/auth/me` | Current user profile, balances, deposit memo |
-| GET | `/api/user/portfolio` | Balances (USDCx + dvUSDCx), pending items, vault stats |
-| POST | `/api/user/transfer-shares` | Transfer dvUSDC to another wallet |
-| POST | `/api/user/custodial-withdraw` | Custodial withdrawal (dvUSDCx → USDCx to destination) |
-| POST | `/api/user/custodial-mint` | Convert custodial USDCx → dvUSDCx (queued) |
-| POST | `/api/user/custodial-burn` | Convert custodial dvUSDCx → USDCx (queued) |
-| POST | `/api/user/custodial-withdraw-usdcx` | Send custodial USDCx to external wallet |
-| POST | `/api/user/custodial-withdraw-dvusdcx` | Send custodial dvUSDCx to external wallet |
-| POST | `/api/user/faucet` | Mint test USDCx (non-custodial, one-time) |
-
-### Operator (JWT + Admin Role Required)
-
-All operator endpoints require a valid JWT token with `role: admin`. Unauthorized requests receive 401/403.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/api/state` | Full vault state + on-chain balances + queues |
-| POST | `/api/process-deposits` | Clear pending deposits (with memo metadata passthrough) |
-| POST | `/api/process-withdrawals` | Clear pending withdrawals (with memo metadata passthrough) |
-| POST | `/api/update-nav` | Update NAV and share price |
-| POST | `/api/transfer` | Raw CIP-56 transfer between parties |
-| POST | `/api/fund-vault` | Designate USDCx as vault reserve |
-| POST | `/api/bridge-to-evm` | Record capital deployed to EVM |
-| POST | `/api/bridge-from-evm` | Record capital returned from EVM |
-| POST | `/api/pause` | Toggle vault pause/unpause |
-| POST | `/api/deposit-tokens` | Add supported deposit token |
-| DELETE | `/api/deposit-tokens/:id` | Remove supported deposit token |
-
----
-
-## Security
-
-### Endpoint Protection
-
-All operator and controller API endpoints require JWT authentication with admin role. This covers vault state access, queue clearing, NAV updates, pause control, token transfers, bridge operations, and deposit token configuration. Public endpoints (deposit, withdraw, deposit-shares, deposit-tokens list) remain open for permissionless interaction.
-
-### Controller Dashboard
-
-The operator controller requires admin authentication via a login gate. All dashboard API calls include authorization headers, and expired or invalid tokens trigger automatic re-authentication.
-
-### Network Isolation
-
-User-facing and operator-facing surfaces are served on separate domains with reverse proxy route filtering. Operator APIs and the controller dashboard are not reachable from the user-facing domain.
-
-### Custodial Integrity
-
-The treasury balance invariant (on-chain treasury tokens ≥ sum of custodial users' DB balances) is maintained through multiple defense layers:
-
-- **Custodial deposits** via the deposit API include on-chain memo metadata for crash recovery, plus a dedup record in `processed_transactions` to prevent indexer double-crediting.
-- **Clearing operations** directly credit custodial balances inline (DB UPDATE) when the target is the treasury party.
-- **Custodial withdrawals** debit the DB first, wrap the on-chain operation in a try-catch, and rollback the DB debit on chain failure.
-- **Transaction indexer** uses three dedup layers: treasury remainder skip (ExercisedEvent Archive detection), clearing dedup (check recent queue entries), and `processed_transactions` unique constraint.
+1. **Non-custodial only** — Users hold their own tokens on-chain. No treasury party, no custodial balances. Maximizes 3rd-party transaction volume for asset issuer marker revenue.
+2. **CIP-56 only on-chain** — Token Holdings and Factories are the sole on-chain contracts. Vault accounting lives in PostgreSQL, reducing Canton traffic cost and UTXO complexity.
+3. **Derived NAV** — NAV = vault_reserve + evm_vault_balance. Share price is always derived, never manually set, preventing accounting errors.
+4. **Memo-based routing** — Deposits and withdrawals use the sender's Canton party ID as a memo in the `dittonetwork.io/memo` metadata key. The indexer parses and routes automatically.
+5. **Separated issuer/operator parties** — `ditto-vault-1` (issuer) signs CIP-56 token contracts. `ditto-vault-operator` manages vault operations. Required by CIP-47 Rule 9.
+6. **Atomic CIP-56 operations** — Multi-command submissions ensure all-or-nothing execution for token operations.
+7. **Defense in depth** — Admin JWT authentication on all operator endpoints. Reverse proxy domain-level route filtering isolates operator APIs from the user-facing surface.
 
 ---
 
@@ -324,13 +206,13 @@ The treasury balance invariant (on-chain treasury tokens ≥ sum of custodial us
 
 Ditto Vault is designed for Canton Featured App compliance (CIP-47):
 
-- **Full CIP-56 compliance** — dvUSDC and USDCx use BurnMintFactory for standard-compatible mint, burn, and transfer operations with metadata passthrough
+- **Full CIP-56 compliance** — dvUSDCx and USDCx use BurnMintFactory for standard-compatible mint, burn, and transfer operations with metadata passthrough
 - **Party separation (Rule 9)** — dedicated issuer party (`ditto-vault-1`) separate from operator, enabling asset issuer markers
-- **Economically motivated transactions** — every CIP-56 operation serves a genuine user need (deposit, withdrawal, transfer, custodial mint/burn)
+- **Non-custodial design** — all user interactions are 3rd-party transactions from the user's own wallet/participant, maximizing asset issuer marker revenue (~$0.91 net per external transaction vs ~$0.17 self-submitted)
+- **Economically motivated transactions** — every CIP-56 operation serves a genuine user need (deposit, withdrawal, transfer)
 - **Metadata on-chain** — `dittonetwork.io/memo` key in Holding metadata enables verifiable transaction routing
 - **Featured App V2 API ready** — `splice-api-featured-app-v2` and `splice-util-featured-app-proxies` included as data dependencies for WalletUserProxy integration
-- **Institutional controls** — operator-gated clearing with full audit trail
-- **Composable ecosystem asset** — dvUSDC is available as a CIP-56 token for any Canton application
+- **Composable ecosystem asset** — dvUSDCx is available as a CIP-56 token for any Canton application (Loop wallet, CantonSwap, Silvana)
 - **Active validator presence** — Ditto operates validators on Canton DevNet, TestNet, and MainNet
 
 ---
@@ -351,11 +233,11 @@ Self-sustaining revenue from protocol operations and Canton network rewards.
 
 | Phase | Status | Scope |
 |---|---|---|
-| **Phase 1 — MVP** | **Complete** | CIP-56 tokens, memo-based deposit/withdraw, custodial/non-custodial modes, PostgreSQL queues, React UI, Docker deployment, DevNet + MainNet validators |
-| **Phase 1.5 — Production Architecture** | **Complete** | Party separation (issuer/operator), metadata passthrough, transaction indexer, custodial USDCx tracking, four custodial actions, registry API, Featured App data dependencies |
-| **Phase 2 — Bridge** | Planned | Circle xReserve integration for USDCx ↔ USDC bridging, end-to-end fund movement |
-| **Phase 3 — Featured App** | In Progress | Committee review, CIP-56 compliance validation, security audit, FeaturedAppRight + WalletUserProxy integration, activity markers |
-| **Phase 4 — Liquidity** | Planned | On-chain secondary market for instant exits, yield distribution mechanism |
+| **Phase 1 — MVP** | **Complete** | CIP-56 tokens, deposit/withdraw queues, PostgreSQL vault accounting, React UI, Docker deployment, DevNet validator |
+| **Phase 2 — V2 Architecture** | **Complete** | Non-custodial only, party separation (issuer/operator), metadata passthrough, transaction indexer, yield-based NAV, Loop wallet integration, admin dashboard |
+| **Phase 3 — Featured App** | In Progress | Committee review, CIP-56 compliance validation, FeaturedAppRight + WalletUserProxy integration, activity markers, DAR vetting on global topology |
+| **Phase 4 — Bridge** | Planned | Circle xReserve integration for USDCx on/off-ramp, end-to-end fund movement |
+| **Phase 5 — Liquidity** | Planned | On-chain secondary market via CantonSwap/Silvana listing, yield distribution |
 
 ---
 
