@@ -12,8 +12,8 @@
 - [4. Memo-based routing](#4-memo-based-routing)
 - [5. Lifecycle flows](#5-lifecycle-flows)
 - [6. Strategy router](#6-strategy-router)
-- [7. Ditto Oracle](#7-ditto-oracle)
-- [8. NAV and share price](#8-nav-and-share-price)
+- [7. Ditto Verification Network (DVN)](#7-ditto-verification-network-dvn)
+- [8. NAV: derivation and on-chain publication](#8-nav-derivation-and-on-chain-publication)
 - [9. Backend services](#9-backend-services)
 - [10. Security model](#10-security-model)
 - [11. Deployment architecture](#11-deployment-architecture)
@@ -37,7 +37,7 @@ flowchart TB
         UX["USDCx<br/>Holding + BurnMintFactory"]
         ALPEND["Alpend Lending"]
         CANTEX["Cantex DEX"]
-        ORACLE["Ditto Oracle<br/>Attested Feeds"]
+        ORACLE["DVN<br/>Attested Feeds"]
     end
 
     subgraph App["Application Server"]
@@ -272,11 +272,23 @@ Rebalances are batched and executed atomically per protocol where possible.
 
 The risk monitor evaluates trigger conditions on every accounting tick. Triggered conditions execute deterministic actions (auto-deleverage, pause adapter, recall to buffer) without operator intervention. Operator intervention is required only for non-routine actions (enabling a new adapter, changing target weights, lifting an emergency pause).
 
+### Phased operator integration
+
+Strategy adapters do not appear in their fully-autonomous form on day one. Each protocol integration progresses through three phases as protocol SDKs and on-chain interfaces mature:
+
+| Phase | Operator burden | Trust assumption | Mitigated by |
+|---|---|---|---|
+| **4a — Manual integration** *(launch phase)* | Operator manually deposits and withdraws on protocol UIs (e.g., Alpend's user interface). Adapter wraps a workflow where `last_value` is updated from the operator's read of the protocol's reported balance. | Operator's NAV updates are honest and timely. | On-chain NAV publication (see §8) — every published NAV is a verifiable receipt that auditors and counterparties can cross-check. |
+| **4b — Semi-automated** | Operator triggers deposits and withdrawals via internal CLI; backend reads protocol state via Ledger API where the protocol exposes one. Reduced human keystrokes, manual sign-off retained for capital movements above a threshold. | Lower than 4a — operator only sets policy and reviews actions; automation reduces error rate. | Same on-chain NAV publication; plus structured logging of every command for auditability. |
+| **4c — Full adapter** | Strategy router operates autonomously. Rebalances, harvests, deleverages on triggers without operator intervention except for policy changes. | Lowest — code is reviewable; operator only sets target weights and risk thresholds. | Code review, deterministic triggers (no discretion), and DVN-attested protocol state. |
+
+Phase 4a is the v1 launch state. It is honest about the team's actual operational burden in the first weeks of MainNet, and it pairs deliberately with the on-chain NAV publication (next section) so that user trust does not depend on operator integrity alone — only on the operator's *timeliness*. Phases 4b and 4c are gated on protocol-side maturity (SDKs, on-chain state readers) more than on the platform's own engineering.
+
 ---
 
-## 7. Ditto Oracle
+## 7. Ditto Verification Network (DVN)
 
-Canton DeFi today lacks a native price-and-state oracle equivalent to Chainlink or Pyth. **Ditto Oracle** is the verification layer that fills this gap, anchored on Ditto Network's existing 16-operator Eigenlayer/Symbiotic restaking set.
+Canton DeFi today lacks a native price-and-state oracle equivalent to Chainlink or Pyth. The **Ditto Verification Network (DVN)** is the verification layer that fills this gap, anchored on Ditto Network's existing 16-operator Eigenlayer/Symbiotic restaking set.
 
 ### Operator quorum
 
@@ -295,15 +307,17 @@ Feed publication is gated by an `m-of-n` operator quorum. Operators co-sign atte
 
 Each feed update is published as a Daml contract on the dedicated `ditto-oracle` party (a separate party from `ditto-vault-1`, per CIP-47 Rule 10). Consumers subscribe by party authorization and read the current attested value via the Ledger API.
 
-Oracle attestations are data publications, not asset transfers; the oracle is not an asset issuer, so Rule 8 does not apply. Under the default rule (Rule 2), the oracle may submit markers up to its net on-chain fees — approximately breakeven against the cost of submitting attestations, modulo the variable reward ratio. Consumer reads of attestation state are off-chain and earn nothing under Rule 4. **Direct revenue from Ditto Oracle therefore comes from basis-point licensing fees charged in USDCx to consumer protocols, not from marker income.**
+Oracle attestations are data publications, not asset transfers; the oracle is not an asset issuer, so Rule 8 does not apply. Under the default rule (Rule 2), the oracle may submit markers up to its net on-chain fees — approximately breakeven against the cost of submitting attestations, modulo the variable reward ratio. Consumer reads of attestation state are off-chain and earn nothing under Rule 4. **Direct revenue from DVN therefore comes from basis-point licensing fees charged in USDCx to consumer protocols, not from marker income.**
 
 ### Internal-first, externalize after proof
 
-The vault is the first internal consumer. All four strategy adapters and the risk monitor consume Ditto Oracle feeds for their pricing and health inputs. This dogfooding period is the precondition for externalization to other Canton DeFi protocols under a basis-point licensing model.
+The vault is the first internal consumer. All four strategy adapters and the risk monitor consume DVN feeds for their pricing and health inputs. This dogfooding period is the precondition for externalization to other Canton DeFi protocols under a basis-point licensing model.
 
 ---
 
-## 8. NAV and share price
+## 8. NAV: derivation and on-chain publication
+
+### Derivation
 
 NAV is **always derived**; share price is **always computed**.
 
@@ -312,7 +326,7 @@ NAV         = vault_reserve + Σ strategy_allocations.last_value
 share_price = NAV / total_shares
 ```
 
-`vault_reserve` is the operator party's USDCx Holding total. `last_value` is updated on every harvest tick or oracle attestation, never set by the operator. The operator cannot set NAV manually; there is no admin endpoint to do so.
+`vault_reserve` is the operator party's base-asset Holding total. `last_value` is updated on every harvest tick or DVN attestation, never set by the operator. The operator cannot set NAV manually; there is no admin endpoint to do so.
 
 ### Yield accrual example
 
@@ -331,6 +345,44 @@ share_price = NAV / total_shares
 4. User redeems 100 dvUSDCx
    100 × $1.05 = 105 USDCx paid out
 ```
+
+### On-chain publication
+
+The accounting plane is off-chain in PostgreSQL for traffic-cost reasons, but vault share price is too important to rely on database integrity alone. NAV is therefore **published on-chain** on a defined cadence, producing a verifiable record that any consumer — auditor, DEX, wallet, user — can read independently of the platform's API.
+
+A dedicated Daml template `NavAnchor` is created per dvToken instrument:
+
+```daml
+template NavAnchor
+  with
+    issuer        : Party       -- ditto-vault-1
+    instrumentId  : InstrumentId
+    nav           : Decimal     -- in base-asset units
+    totalShares   : Decimal
+    sharePrice    : Decimal
+    asOfRound     : Int         -- Splice reward round at publication
+    proof         : Optional Text  -- hash linking to off-chain attestation bundle
+  where
+    signatory issuer
+    observer  instrumentId.admin
+```
+
+Each publication archives the previous `NavAnchor` for that instrument and creates a new one. Consumers index the active `NavAnchor` per instrument as the canonical on-chain NAV.
+
+**Cadence**:
+- **Per-harvest publication** — every time a strategy adapter realizes yield (manually triggered in Phase 4a, automatically in 4c), the new NAV is published immediately. Share-price changes from harvest events are reflected on-chain without lag.
+- **Heartbeat publication** — every 6 hours, even when no harvest has occurred. Bounds NAV staleness for low-activity vaults.
+
+A 6-hour heartbeat keeps publication volume manageable (4 per day per vault, 20 per day across the launch lineup) while still tighter than the typical TradFi NAV cadence.
+
+**Marker economics**: NAV publication transactions are operator-submitted. Under Rule 2 of the Featured App Coupon Guidance, operator-submitted transactions earn marker weight only up to net qualifying on-chain fees — **roughly breakeven** with publication cost, modulo small upside from the 0.1 MB/round free synchronizer credit. NAV publication is **not** a profit-driving marker stream; its value is:
+
+- **Verifiable share price** — composability with Canton DEXes and wallets pricing dvTokens.
+- **Audit trail** — chain-reconstructable historical NAV.
+- **Trust mitigation for Phase 4a manual integration** — operator-driven workflow is acceptable because every NAV update produces an on-chain receipt.
+- **Foundation for DVN** — publishing our own NAV is the wedge into attesting other protocols' prices.
+
+**Relationship to DVN**: NAV publication is a special case of the verification layer described in §7: `ditto-vault-1` attesting to its own NAV. Once DVN is operational, the operator-quorum co-signs NAV attestations alongside the issuer signature, raising the trust grade from "operator's word" to "operator-quorum-attested" without architectural change.
 
 ---
 
@@ -352,7 +404,7 @@ Persistent background process polling `/v2/updates` every 10 seconds. State is c
 
 ### Strategy router service
 
-Persistent background process running the allocator, rebalancer, and risk monitor on each accounting tick. Reads protocol state via the Ledger API and Ditto Oracle feeds. Writes allocation changes via Ledger API command submissions.
+Persistent background process running the allocator, rebalancer, and risk monitor on each accounting tick. Reads protocol state via the Ledger API and DVN feeds. Writes allocation changes via Ledger API command submissions.
 
 ### Auth
 
@@ -412,7 +464,7 @@ The operator party's actAs/readAs credentials are stored as environment variable
 | dvUSDCx + USDCx Holdings | Canton synchronizer | Daml templates from `ditto-vault-contracts` |
 | BurnMintFactory contracts | Canton synchronizer | Daml templates from `ditto-vault-contracts` |
 | Alpend / Cantex positions | Canton synchronizer | Daml templates from respective protocols |
-| Ditto Oracle attestations | Canton synchronizer | Daml templates from `ditto-oracle` (dedicated party) |
+| DVN attestations | Canton synchronizer | Daml templates from `ditto-oracle` (dedicated party) |
 | Express.js + indexer + strategy router | Application server | Docker container, Express.js process |
 | PostgreSQL | Application server (managed) | Managed PG instance |
 | User app (React) | Application server | Static bundle served by Express |

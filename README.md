@@ -10,9 +10,11 @@ Ditto Vault is a Canton-native asset management platform — a system for issuin
 
 There is no cross-chain bridging and no off-Canton custody: every dollar of vault NAV is held in a Canton-native protocol position or in idle reserves. All user-facing interactions are non-custodial CIP-56 transfers.
 
-The platform is governed by Ditto Network — operator of 16 nodes across Eigenlayer and Symbiotic restaking infrastructure with $200M+ in cryptoeconomically-secured TVL — and is the reference application for the **Ditto Oracle**, an operator-attested price and state feed for the broader Canton DeFi ecosystem.
+The platform is governed by Ditto Network — operator of 16 nodes across Eigenlayer and Symbiotic restaking infrastructure with $200M+ in cryptoeconomically-secured TVL — and is the reference application for the **Ditto Verification Network (DVN)**, an operator-attested price and state feed for the broader Canton DeFi ecosystem.
 
-Vault accounting (NAV, share price, deposit/withdrawal queues, per-strategy allocations) lives in PostgreSQL; only token Holdings and Factories live on-chain. This separation keeps Canton traffic minimal while preserving full CIP-56 composability across the entire vault lineup.
+Vault accounting (NAV, share price, deposit/withdrawal queues, per-strategy allocations) lives in PostgreSQL; token Holdings, Factories, and **`NavAnchor` contracts** live on-chain. NAV is published on-chain on every harvest event and on a 6-hour heartbeat — making vault share price independently verifiable from chain state alone, without trusting any centralized API. This hybrid design keeps Canton traffic minimal while preserving full CIP-56 composability and trust-minimized share-price discovery across the entire vault lineup.
+
+**Operator integration phases**: protocol integration (Alpend, Cantex) ships in three stages — Phase 4a runs as a manually-operated workflow with on-chain NAV receipts, Phase 4b adds CLI-driven semi-automation, Phase 4c is fully autonomous. v1 launch uses Phase 4a; this is honest about the team's operational burden in the first weeks of MainNet, and pairs deliberately with on-chain NAV publication so user trust does not depend on operator integrity alone.
 
 ---
 
@@ -27,7 +29,7 @@ flowchart TB
         UX["USDCx<br/>Holding + BurnMintFactory"]
         ALPEND["Alpend<br/>Lending"]
         CANTEX["Cantex<br/>DEX"]
-        ORACLE["Ditto Oracle<br/>Operator-Attested Feeds"]
+        ORACLE["DVN<br/>Operator-Attested Feeds"]
         ISS --- DV
         ISS --- UX
         OP --- ALPEND
@@ -49,7 +51,7 @@ flowchart TB
     style App fill:#0d1117,stroke:#4dabf7,color:#fff
 ```
 
-**Three planes:** the on-chain plane is pure CIP-56 (tokens, party separation, factories). The off-chain plane is the strategy router, indexer, and accounting. The verification plane (Ditto Oracle) sits between them, providing trust-minimized prices and protocol-state attestations that the router uses for allocation and risk decisions.
+**Three planes:** the on-chain plane is pure CIP-56 (tokens, party separation, factories). The off-chain plane is the strategy router, indexer, and accounting. The verification plane (DVN) sits between them, providing trust-minimized prices and protocol-state attestations that the router uses for allocation and risk decisions.
 
 ---
 
@@ -63,7 +65,7 @@ The platform issues one dvToken per vault, all under the same `ditto-vault-1` is
 | **USDCx** | Stablecoin deposited by users, routed to strategies | CIP-56 Holding + BurnMintFactory |
 | **dvUSDCx-LOCK90, dvUSDCx-LOCK1Y, dvCC, dvCBTC, …** *(future)* | Additional vault shares — different base assets, lock terms, and strategy mixes | CIP-56 Holding + BurnMintFactory |
 
-Every dvToken is independently registered as a Canton Featured App under CIP-47 — see [Revenue Model](#revenue-model) for marker mechanics.
+Every dvToken is designed for registration as a Canton Featured App under CIP-47, with approval pending Phase 3 deliverables — see [Revenue Model](#revenue-model) for marker mechanics and [Featured App Alignment](#featured-app-alignment) for the Phase 3 prerequisites that gate marker eligibility.
 
 Both tokens implement Splice CIP-56 token-standard interfaces. Holdings follow the UTXO model — minting burns inputs and creates outputs. Factories are nonconsuming, allowing multiple mint/burn operations in a single atomic batch.
 
@@ -92,11 +94,11 @@ The strategy router rebalances on programmatic triggers — utilization spikes, 
 
 ---
 
-## Ditto Oracle
+## Ditto Verification Network (DVN)
 
 Canton DeFi today has no native price oracle equivalent of Chainlink or Pyth. Lending and DEX protocols on Canton currently rely on undisclosed or self-reported price sources — a load-bearing systemic risk as TVL grows.
 
-Ditto Network already operates a 16-node operator set across Eigenlayer and Symbiotic, securing $200M+ in restaking TVL. **Ditto Oracle** repurposes that operator set as a quorum-attested price and state feed for the Canton ecosystem:
+Ditto Network already operates a 16-node operator set across Eigenlayer and Symbiotic, securing $200M+ in restaking TVL. **DVN** repurposes that operator set as a quorum-attested price and state feed for the Canton ecosystem:
 
 | Feed | Content | Cadence |
 |---|---|---|
@@ -142,7 +144,7 @@ Users can transfer dvUSDCx directly to any Canton party. Standard CIP-56 transfe
 
 ### Strategy allocation and harvest
 
-The router moves USDCx between the idle buffer and the four strategy adapters based on real-time APY readings (sourced from Ditto Oracle), utilization caps, and risk triggers. Harvest events realize accrued yield back into vault NAV, which is reflected in the dvUSDCx share price on the next accounting tick.
+The router moves USDCx between the idle buffer and the four strategy adapters based on real-time APY readings (sourced from DVN), utilization caps, and risk triggers. Harvest events realize accrued yield back into vault NAV, which is reflected in the dvUSDCx share price on the next accounting tick.
 
 ### Transaction indexer
 
@@ -282,7 +284,7 @@ Fee schedules are set per vault. Higher-risk and longer-locked vaults carry high
 
 ### Asset-issuer markers (per dvToken, per third-party transaction)
 
-Every dvToken is a CIP-56 instrument issued by `ditto-vault-1` and registered as a Canton Featured App under CIP-47. Per the asset-issuer rule (Rule 8 of the Featured App Coupon Guidance, revised 22 April 2026):
+Every dvToken is a CIP-56 instrument issued by `ditto-vault-1`, designed for registration as a Canton Featured App under CIP-47. Featured App approval and asset-issuer marker eligibility are pending Phase 3 prerequisites (Rule 9 — see [Featured App Alignment](#featured-app-alignment)). Per the asset-issuer rule (Rule 8 of the Featured App Coupon Guidance, revised 22 April 2026):
 
 > Asset Issuers may submit **1 marker per transaction submitted by 3rd parties / transaction originator / venue**. Asset Issuers may only submit 1 marker even when the 3rd party batches many asset movements into a single transaction.
 
@@ -308,8 +310,8 @@ Markers fire only on Canton-native transactions: dvTokens are issued and traded 
 
 | Source | Mechanism |
 |---|---|
-| **Ditto Oracle attestation fees** | Basis-point licensing in USDCx, paid by Canton DeFi protocols consuming Ditto Oracle price/state feeds. Direct revenue, not marker-dependent. |
-| **Ditto Oracle markers** | Asset-issuer markers on oracle-attestation CIP-56 transactions when consumed by third-party protocols. Subject to ongoing alignment review with Canton Foundation; assumed material only at scale. |
+| **DVN attestation fees** | Basis-point licensing in USDCx, paid by Canton DeFi protocols consuming DVN price/state feeds. Direct revenue, not marker-dependent. |
+| **DVN markers** | Asset-issuer markers on oracle-attestation CIP-56 transactions when consumed by third-party protocols. Subject to ongoing alignment review with Canton Foundation; assumed material only at scale. |
 
 ---
 
@@ -321,8 +323,8 @@ Markers fire only on Canton-native transactions: dvTokens are issued and traded 
 | **Phase 2 — V2 Architecture** | ✅ Complete | Non-custodial only, party separation, metadata passthrough, transaction indexer, yield-based NAV, Loop wallet, admin dashboard |
 | **Phase 3 — Featured App** | 🟡 In progress | Committee review, CIP-56 compliance validation, FeaturedAppRight + WalletUserProxy integration, activity markers, DAR vetting on global topology |
 | **Phase 4 — Strategy Router** | 🔵 Planned | Adapter framework, AlpendSupply + AlpendLooped + CantexLpHedged + CantexLpNaked, allocator + rebalancer, risk monitor |
-| **Phase 5 — Ditto Oracle (Internal)** | 🔵 Planned | Operator-quorum attestation contracts, on-chain feed publication, vault router integration |
-| **Phase 6 — Ditto Oracle (External)** | 🔵 Planned | Externalize feeds to Canton DeFi protocols, basis-point licensing model |
+| **Phase 5 — DVN (Internal)** | 🔵 Planned | Operator-quorum attestation contracts, on-chain feed publication, vault router integration |
+| **Phase 6 — DVN (External)** | 🔵 Planned | Externalize feeds to Canton DeFi protocols, basis-point licensing model |
 | **Phase 7 — Vault Lineup Expansion** | 🔵 Planned | Additional vault products: `dvUSDCx-LOCK90`, `dvUSDCx-LOCK1Y`, `dvCC`, `dvCBTC`. Each its own CIP-56 instrument, fee schedule, and marker stream. |
 | **Phase 8 — Private Credit Tranche** | 🔵 Planned | SPV-wrapped credit fund tokens via dedicated locked-vault product (`dvUSDCx-LOCK1Y` with credit-fund strategy enabled), targeting illiquid double-digit yield |
 | **Phase 9 — Liquidity** | 🔵 Planned | Secondary market for dvTokens via CantonSwap / Silvana, cross-app composability, market-making to drive marker velocity |

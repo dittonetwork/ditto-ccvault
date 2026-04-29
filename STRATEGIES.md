@@ -143,7 +143,7 @@ The router evaluates these continuously. Each trigger has a deterministic action
 | T8 | Idle buffer < 1% of NAV (withdrawal-pressure floor) | Pause new deposits, recall from all strategies until restored |
 | T9 | Strategy adapter reports unhealthy oracle / protocol state | Pause that adapter, recall to buffer |
 
-Triggers T1–T8 are evaluated each accounting tick (currently every 10s aligned with the indexer poll). T9 evaluates on every Ditto Oracle attestation update.
+Triggers T1–T8 are evaluated each accounting tick (currently every 10s aligned with the indexer poll). T9 evaluates on every DVN attestation update.
 
 ---
 
@@ -174,14 +174,24 @@ NAV = vault_reserve + Σ strategy_allocations.last_value
 share_price = NAV / total_shares
 ```
 
-`last_value` is updated on every harvest tick or oracle attestation, never set by the operator. NAV is fully derived; the operator cannot set NAV manually.
+`last_value` is updated on every harvest tick or DVN attestation, never set arbitrarily by the operator (the operator cannot, e.g., type a number into an admin form). NAV is fully derived; the operator cannot set NAV manually.
+
+### Phased operator integration
+
+For v1 (Phase 4a), each adapter wraps a **manual operator workflow**: the operator deposits and withdraws on the protocol's UI directly, and `last_value` is updated from the operator's read of the protocol's reported balance. This is honest about the team's actual operational burden in the early weeks of MainNet, and it ships in days rather than months.
+
+The trust gap (operator-driven NAV updates) is mitigated by the on-chain NAV publication mechanism described in [ARCHITECTURE.md §8](./ARCHITECTURE.md#8-nav-derivation-and-on-chain-publication). Every published NAV is a verifiable receipt that auditors and counterparties cross-check against protocol-side state.
+
+Phase 4b adds CLI-driven semi-automation; Phase 4c is the fully-autonomous adapter that requires only protocol-side maturity (SDKs, on-chain state readers).
 
 ### Harvest cadence
 
 Adapters are harvested on a per-protocol cadence:
-- Alpend supply: continuous interest accrual, no on-chain harvest required (value is read from the supply receipt).
+- Alpend supply: continuous interest accrual, no on-chain harvest required (value is read from the supply receipt; in Phase 4a, operator reads from Alpend UI).
 - Alpend looped: same.
 - Cantex LP: fees compound into the pool position; periodic harvest claim required to realize them into NAV.
+
+Each harvest tick produces a new `NavAnchor` on-chain (see ARCHITECTURE §8).
 
 ### Withdrawal serving
 
@@ -212,13 +222,15 @@ Each new strategy is added as a separate adapter behind the same interface and g
 
 The strategy framework above supports a lineup of vault products, each its own CIP-56 dvToken with its own fee schedule and strategy mix:
 
-| Vault | Base asset | Lock term | Strategy mix | Indicative target APY | Indicative fees |
+| Vault | Base asset | Lock term | Strategy mix | Target APY | Indicative fees |
 |---|---|---|---|---|---|
-| **`dvUSDCx-CORE`** *(launch product)* | USDCx | Daily-liquid | Legs 1–4 with conservative weights, ≥10% buffer | 5–9% | 1.5% mgmt / 10% carry |
-| **`dvUSDCx-LOCK90`** | USDCx | 90 days | Legs 1–4 with looser buffer, higher Leg 2 weight | 6–11% | 1.5% mgmt / 15% carry |
-| **`dvUSDCx-LOCK1Y`** | USDCx | 1 year | Legs 1–4 plus tokenized RWA tranche (when live) | 10–14% | 2.0% mgmt / 20% carry |
+| **`dvUSDCx-CORE`** *(launch product)* | USDCx | Daily-liquid | Legs 1–4 with conservative weights, ≥10% buffer | ~5% measured (passive Alpend USDCx supply); 5–9% modeled, gated on Alpend CC-borrow rate disclosure | 1.5% mgmt / 10% carry |
+| **`dvUSDCx-LOCK90`** | USDCx | 90 days | Legs 1–4 with looser buffer, higher Leg 2 weight | 6–11% modeled; same gating | 1.5% mgmt / 15% carry |
+| **`dvUSDCx-LOCK1Y`** | USDCx | 1 year | Legs 1–4 plus tokenized RWA tranche (when live) | Double-digit target, contingent on private credit fund partnership and SPV setup | 2.0% mgmt / 20% carry |
 | **`dvCC`** *(planned)* | CC | Daily-liquid | Alpend CC supply + future CC strategies | TBD | 1.0% mgmt / 10% carry |
 | **`dvCBTC`** *(planned)* | CBTC | Daily-liquid | Alpend CBTC supply + future CBTC strategies | TBD | 1.0% mgmt / 10% carry |
+
+**Reading these numbers**: Only the Alpend USDCx passive-supply rate is currently *measured* (~4.85% per April 2026 Alpend disclosure). Every other range is *modeled* — derived from rate-spread assumptions that depend on Alpend's CC borrow market, Cantex realized fee APY, and protocol-level data not yet published. Numbers will be updated as live measurement replaces modeling.
 
 All vaults share the same backend, indexer, oracle, and accounting infrastructure. They differ only in strategy mix, base asset, lock term, and fee schedule. Adding a new vault is a configuration change and a new dvToken instrument — not a new code base.
 
