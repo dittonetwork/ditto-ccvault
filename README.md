@@ -59,17 +59,17 @@ flowchart TB
 
 The platform issues one dvToken per vault, all under the same `ditto-vault-1` issuer party but with distinct `instrumentId.id` values. The first token is `dvUSDCx`; additional tokens follow the same pattern.
 
-| Token | Purpose | Standard |
-|---|---|---|
-| **dvUSDCx** | `dvUSDCx-CORE` vault share — daily-liquid USDCx vault | CIP-56 Holding + BurnMintFactory |
-| **USDCx** | Stablecoin deposited by users, routed to strategies | CIP-56 Holding + BurnMintFactory |
-| **dvUSDCx-LOCK90, dvUSDCx-LOCK1Y, dvCC, dvCBTC, …** *(future)* | Additional vault shares — different base assets, lock terms, and strategy mixes | CIP-56 Holding + BurnMintFactory |
+| Token | Issuer | Purpose | Standard |
+|---|---|---|---|
+| **dvUSDCx** | `ditto-vault-1` | `dvUSDCx-CORE` vault share — daily-liquid USDCx vault | CIP-56 Holding + BurnMintFactory |
+| **dvUSDCx-LOCK90, dvUSDCx-LOCK1Y, dvCC, dvCBTC, …** *(future)* | `ditto-vault-1` | Additional vault shares — different base assets, lock terms, and strategy mixes | CIP-56 Holding + BurnMintFactory |
+| **USDCx** | Circle (MainNet) / `usdcx-issuer` (DevNet test admin) | Stablecoin deposited by users, routed to strategies | CIP-56 Holding + BurnMintFactory |
 
 Every dvToken is designed for registration as a Canton Featured App under CIP-47, with approval pending Phase 3 deliverables — see [Revenue Model](#revenue-model) for marker mechanics and [Featured App Alignment](#featured-app-alignment) for the Phase 3 prerequisites that gate marker eligibility.
 
-Both tokens implement Splice CIP-56 token-standard interfaces. Holdings follow the UTXO model — minting burns inputs and creates outputs. Factories are nonconsuming, allowing multiple mint/burn operations in a single atomic batch.
+All these tokens implement Splice CIP-56 token-standard interfaces. Holdings follow the UTXO model — minting burns inputs and creates outputs. Factories are nonconsuming, allowing multiple mint/burn operations in a single atomic batch.
 
-**Party Separation (CIP-47 Compliant):** A dedicated issuer party (`ditto-vault-1`) signs all CIP-56 token contracts. The operator party (`ditto-vault-operator`) manages vault operations and protocol allocations. This separation satisfies CIP-47 Rule 9 for Featured App Activity Marker eligibility.
+**Party Separation (CIP-47 Compliant):** A dedicated issuer party (`ditto-vault-1`) signs all dvToken CIP-56 contracts and acts as the asset issuer for marker purposes. The operator party (`ditto-vault-operator`) manages vault operations and protocol allocations. This separation satisfies CIP-47 Rule 10 (Separate Party Concerns) — the precondition for asset-issuer Featured App marker eligibility on each dvToken.
 
 **Metadata Passthrough:** The BurnMintFactory propagates `extraArgs.meta` into created Holdings, enabling on-chain memo tracking via the `dittonetwork.io/memo` key. The transaction indexer parses these to detect and route deposits and withdrawals automatically.
 
@@ -77,7 +77,7 @@ Both tokens implement Splice CIP-56 token-standard interfaces. Holdings follow t
 
 ## Yield Strategies
 
-The vault router allocates USDCx across four mechanically distinct strategies on two Canton-native protocols. Each strategy responds to a different market regime, so the blended return is more stable than any single leg.
+The strategy router allocates each vault's base asset across mechanically distinct strategies on Canton-native protocols. The launch product `dvUSDCx-CORE` runs a four-leg allocation across Alpend (lending) and Cantex (DEX); future vaults reuse the same adapter framework with strategies appropriate to their base asset. The four legs of the launch product:
 
 | Strategy | Venue | Mechanism | Primary risk |
 |---|---|---|---|
@@ -88,7 +88,7 @@ The vault router allocates USDCx across four mechanically distinct strategies on
 
 Plus a dynamic **idle buffer** (≥10% of NAV by default) sized to absorb instant withdrawals.
 
-The strategy router rebalances on programmatic triggers — utilization spikes, rate inversions, hedge drift, leverage bands — not on operator discretion. See [STRATEGIES.md](./STRATEGIES.md) for the full mechanics, target weights, and rebalance rule set.
+The strategy router's rebalance logic is rule-based — utilization spikes, rate inversions, hedge drift, leverage bands — not operator discretion over what to do. The *execution medium* varies by integration phase: Phase 4a runs the rule-driven decisions through manual operator workflows on protocol UIs; Phases 4b and 4c progressively automate the execution. See [STRATEGIES.md](./STRATEGIES.md) for the full mechanics, target weights, and rebalance rule set.
 
 **Stable/stable strategy** *(future)* — the lowest-risk leg in any USDC-denominated vault is a stable/stable LP (e.g. USDC/USDT). No counter-stable to USDCx exists on Canton today; this strategy will be enabled as soon as one ships.
 
@@ -230,9 +230,9 @@ All vault state lives in PostgreSQL. NAV is **always derived** from vault holdin
 2. **Non-custodial only** — users hold their own tokens on-chain. No treasury party, no custodial balances. Maximizes third-party transaction volume for asset-issuer marker revenue.
 3. **CIP-56 only on-chain** — token Holdings and Factories are the sole on-chain contracts. Vault accounting lives in PostgreSQL, reducing Canton traffic cost and UTXO complexity.
 4. **Derived NAV** — NAV = vault_reserve + sum of strategy allocations. Share price is always derived, never manually set.
-5. **Programmatic rebalancing** — strategy weights and risk triggers are rule-based, not operator-discretion. See [STRATEGIES.md](./STRATEGIES.md).
+5. **Rule-based rebalancing** — strategy weights and risk triggers are deterministic, not operator-discretion. The *decision logic* is the same across integration phases; only the *execution medium* varies (manual UI in 4a, semi-automated CLI in 4b, fully autonomous in 4c). See [STRATEGIES.md](./STRATEGIES.md).
 6. **Memo-based routing** — deposits and withdrawals use the sender's Canton party ID as a memo in `dittonetwork.io/memo`. The indexer parses and routes automatically.
-7. **Separated issuer/operator parties** — `ditto-vault-1` (issuer) signs CIP-56 tokens. `ditto-vault-operator` manages vault operations. Required by CIP-47 Rule 9.
+7. **Separated issuer/operator parties** — `ditto-vault-1` (issuer) signs dvToken CIP-56 contracts. `ditto-vault-operator` manages vault operations and protocol interactions. Required by CIP-47 Rule 10 (Separate Party Concerns).
 8. **Atomic CIP-56 operations** — multi-command submissions ensure all-or-nothing execution.
 9. **Defense in depth** — admin JWT authentication on all operator endpoints. Reverse proxy domain-level route filtering isolates operator APIs from user-facing surfaces.
 
@@ -321,7 +321,7 @@ Markers fire only on Canton-native transactions: dvTokens are issued and traded 
 |---|---|---|
 | **Phase 1 — MVP** | ✅ Complete | CIP-56 tokens, deposit/withdraw queues, PostgreSQL vault accounting, React UI, Docker, DevNet validator |
 | **Phase 2 — V2 Architecture** | ✅ Complete | Non-custodial only, party separation, metadata passthrough, transaction indexer, yield-based NAV, Loop wallet, admin dashboard |
-| **Phase 3 — Featured App** | 🟡 In progress | Committee review, CIP-56 compliance validation, FeaturedAppRight + WalletUserProxy integration, activity markers, DAR vetting on global topology |
+| **Phase 3 — Featured App** | 🟡 In progress | Tokenomics Committee review, Rule 9 prerequisites (Console wallet integration + DVP listing on CantonSwap or equivalent), `FeaturedAppRight` + `WalletUserProxy` integration, automated marker submission service, `NavAnchor` on-chain publication infrastructure, DAR vetting on global topology |
 | **Phase 4 — Strategy Router** | 🔵 Planned | Adapter framework, AlpendSupply + AlpendLooped + CantexLpHedged + CantexLpNaked, allocator + rebalancer, risk monitor |
 | **Phase 5 — DVN (Internal)** | 🔵 Planned | Operator-quorum attestation contracts, on-chain feed publication, vault router integration |
 | **Phase 6 — DVN (External)** | 🔵 Planned | Externalize feeds to Canton DeFi protocols, basis-point licensing model |

@@ -1,8 +1,8 @@
 # Ditto Vault — Yield Strategies
 
-> Canton Network · CIP-56 · Multi-strategy USDCx vault
+> Canton Network · CIP-56 · Multi-vault, multi-strategy platform
 
-This document describes the yield strategies the vault router allocates across, the target weights, and the rebalance and risk triggers that drive allocation decisions. All strategies are USDCx-denominated and live on Canton-native protocols.
+This document describes the yield strategies the vault router allocates across, the target weights, and the rebalance and risk triggers that drive allocation decisions. The four strategy legs detailed in §2 are designed for the launch product `dvUSDCx-CORE` and its USDCx-denominated siblings (`dvUSDCx-LOCK90`, `dvUSDCx-LOCK1Y`). Future vaults denominated in other base assets (`dvCC`, `dvCBTC`) reuse the same adapter framework with protocol-specific strategy implementations — see §7 for the vault product variant lineup. All strategies live on Canton-native protocols.
 
 ---
 
@@ -14,6 +14,7 @@ This document describes the yield strategies the vault router allocates across, 
 - [4. Rebalance and risk triggers](#4-rebalance-and-risk-triggers)
 - [5. Execution and accounting](#5-execution-and-accounting)
 - [6. Future strategies](#6-future-strategies)
+- [7. Vault product variants](#7-vault-product-variants)
 
 ---
 
@@ -147,7 +148,7 @@ These weights are **target ranges**, not hard allocations. The router moves capi
 
 ## 4. Rebalance and risk triggers
 
-The router evaluates these continuously. Each trigger has a deterministic action — no operator discretion required for routine rebalancing.
+The router evaluates these continuously. Each trigger has a deterministic action — there is no operator *discretion* over what to do when a trigger fires. The execution medium varies by integration phase (manual UI workflow in 4a, semi-automated CLI in 4b, fully autonomous in 4c), but the rule logic is identical across phases.
 
 | # | Trigger | Action |
 |---|---|---|

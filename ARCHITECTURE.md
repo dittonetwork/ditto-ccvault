@@ -24,7 +24,7 @@
 
 Ditto Vault operates with a **hybrid on-chain / off-chain architecture** spanning two execution environments, both inside Canton:
 
-- **Canton Network** — CIP-56 token contracts for dvUSDCx and USDCx, plus protocol positions on Alpend and Cantex. The on-chain plane carries token state, party authorization, and protocol allocations.
+- **Canton Network** — CIP-56 token contracts for every dvToken in the platform lineup (`dvUSDCx`, `dvUSDCx-LOCK90`, `dvCC`, …) plus the base assets (USDCx, CC, CBTC), `NavAnchor` publications per dvToken, and protocol positions on Alpend and Cantex. The on-chain plane carries token state, party authorization, protocol allocations, and verifiable NAV.
 - **Application Server** — PostgreSQL for vault accounting and queue state, Express.js for API and frontend serving, the strategy router for allocation logic.
 
 There is no third execution environment. The vault is fully Canton-native: no bridges, no off-Canton custody, no synthetic exposure.
@@ -58,29 +58,22 @@ This design keeps the on-chain surface minimal — only token contracts and prot
 
 ## 2. On-chain: CIP-56 token contracts
 
-The vault relies on the Splice CIP-56 token standard for all token operations. Two tokens are issued by the same issuer party:
+The vault relies on the Splice CIP-56 token standard for all token operations. Two classes of token are involved:
 
-| Token | Standard | Purpose |
-|---|---|---|
-| **dvUSDCx** | CIP-56 Holding + BurnMintFactory | Vault share token |
-| **USDCx** | CIP-56 Holding + BurnMintFactory | Stablecoin held and routed by the operator |
+| Token class | Issuer | Standard | Purpose |
+|---|---|---|---|
+| **dvTokens** (`dvUSDCx`, `dvUSDCx-LOCK90`, `dvUSDCx-LOCK1Y`, `dvCC`, `dvCBTC`, …) | `ditto-vault-1` | CIP-56 Holding + BurnMintFactory per instrument | Vault shares — one CIP-56 instrument per vault |
+| **Base assets** (`USDCx`, `CC`, `CBTC`, …) | External (Circle for USDCx on MainNet; SVs for CC; etc.) | CIP-56 Holding + transfer/burn-mint as appropriate to issuer | User-deposited assets that the operator routes into strategies |
+
+The platform issues dvTokens; it does not issue base assets. On DevNet a test party `usdcx-issuer` admins a placeholder USDCx for development purposes only.
 
 ### Holding (UTXO model)
 
-Each user balance is represented by one or more `Holding` contracts, parameterized by `instrumentId = (admin, id)`, `owner`, `amount`, and `meta`. The instrument admin is `ditto-vault-1` for both tokens. Holdings are immutable: balance changes are achieved by burning input Holdings and minting new ones.
+Each balance is represented by one or more `Holding` contracts, parameterized by `instrumentId = (admin, id)`, `owner`, `amount`, and `meta`. For dvTokens, the instrument admin is `ditto-vault-1`. For USDCx and other base assets, the admin is the external issuer (Circle, etc.). Holdings are immutable: balance changes are achieved by burning input Holdings and minting new ones.
 
 ### BurnMintFactory (atomic batches)
 
-Mint, burn, and transfer operations are exercised through a single nonconsuming `BurnMintFactory` contract per instrument. Multi-Holding operations are atomic: the entire batch (e.g., burn 1 input + mint 2 outputs) succeeds or fails together. This eliminates partial-state hazards in deposit/withdraw clearing and in strategy router operations that move USDCx between the operator party and protocol positions.
-
-### Party separation (CIP-47 Rule 9)
-
-Two parties:
-
-- **`ditto-vault-1`** — issuer, signs CIP-56 token contracts for **every** dvToken in the platform lineup (`dvUSDCx`, `dvUSDCx-LOCK90`, `dvUSDCx-LOCK1Y`, `dvCC`, `dvCBTC`, …). Sole admin for each instrument's BurnMintFactory.
-- **`ditto-vault-operator`** — vault operations: holds reserves, executes strategy allocations, processes deposit/withdrawal queues across all vaults.
-
-Separating issuer from operator satisfies CIP-47 Rule 9 — the precondition for asset-issuer Featured App marker eligibility on every dvToken.
+Mint, burn, and transfer operations are exercised through a single nonconsuming `BurnMintFactory` contract per dvToken instrument. Multi-Holding operations are atomic: the entire batch (e.g., burn 1 input + mint 2 outputs) succeeds or fails together. This eliminates partial-state hazards in deposit/withdraw clearing and in strategy router operations that move base assets between the operator party and protocol positions.
 
 ### Multi-vault topology
 
@@ -125,10 +118,11 @@ All mutable vault state lives in PostgreSQL. The on-chain plane is the source of
 
 | Table | Purpose |
 |---|---|
-| `vault_state` | Singleton: NAV, total shares, share price, idle reserve, paused flag |
-| `strategy_allocations` | One row per (strategy_id, asset): deployed amount, last marked value, last harvest timestamp |
-| `deposit_queue` | Pending USDCx → dvUSDCx conversions with `pending` / `cleared` / `rejected` |
-| `withdrawal_queue` | Pending dvUSDCx → USDCx conversions with same statuses |
+| `vault_state` | One row per dvToken instrument: NAV, total shares, share price, idle reserve, paused flag |
+| `strategy_allocations` | One row per (instrument_id, strategy_id, asset): deployed amount, last marked value, last harvest timestamp |
+| `deposit_queue` | Pending base-asset → dvToken conversions with `pending` / `cleared` / `rejected`, keyed by target dvToken instrument |
+| `withdrawal_queue` | Pending dvToken → base-asset conversions with the same statuses |
+| `nav_anchors` | Mirror of the on-chain `NavAnchor` contracts per instrument: latest published nav / sharePrice / asOfRound, contractId for chain lookup |
 | `processed_transactions` | Indexer dedup table: keys on `(updateId, contractId)` |
 | `indexer_state` | Singleton: last processed ledger offset |
 | `users` | Registered users for the user app: party ID, role (`user`/`admin`), JWT-bound credentials |
@@ -152,10 +146,10 @@ The vault accepts deposits and withdrawals via plain CIP-56 transfers, with rout
 dittonetwork.io/memo: "<recipient_party_id> [optional_freeform]"
 ```
 
-The first whitespace-delimited segment is parsed as a Canton party ID and used as the destination for the corresponding outflow:
+The first whitespace-delimited segment is parsed as a Canton party ID and used as the destination for the corresponding outflow. Routing is dispatched by the `instrumentId` of the inbound Holding:
 
-- For a USDCx deposit, the party ID is the recipient of newly-minted dvUSDCx.
-- For a dvUSDCx withdrawal, the party ID is the recipient of redeemed USDCx.
+- Inbound base-asset Holding (e.g., USDCx, CC, CBTC) at the operator → queue as a deposit for the corresponding dvToken vault; party ID is the recipient of newly-minted dvToken shares.
+- Inbound dvToken Holding (e.g., dvUSDCx, dvCC) at the operator → queue as a withdrawal; party ID is the recipient of redeemed base asset.
 
 If the memo is missing or unparseable, the transaction is treated as an internal operator operation and skipped by the routing path.
 
@@ -229,7 +223,7 @@ sequenceDiagram
 
 ## 6. Strategy router
 
-The strategy router is the off-chain decision layer that allocates USDCx across protocol positions and serves withdrawal demand.
+The strategy router is the off-chain decision layer that allocates each vault's base asset across protocol positions and serves withdrawal demand. For `dvUSDCx-CORE`, this means allocating USDCx across Alpend and Cantex; for `dvCC` it means allocating CC; for `dvCBTC` it means CBTC. The router is base-asset-agnostic — protocol adapters are parameterized by asset.
 
 ### Adapter pattern
 
@@ -369,6 +363,7 @@ A dedicated Daml template `NavAnchor` is created per dvToken instrument:
 template NavAnchor
   with
     issuer        : Party       -- ditto-vault-1
+    operator      : Party       -- ditto-vault-operator (read access)
     instrumentId  : InstrumentId
     nav           : Decimal     -- in base-asset units
     totalShares   : Decimal
@@ -377,8 +372,10 @@ template NavAnchor
     proof         : Optional Text  -- hash linking to off-chain attestation bundle
   where
     signatory issuer
-    observer  instrumentId.admin
+    observer  operator
 ```
+
+Discoverability for external consumers (DEXes, wallets, auditors) is via Ledger API queries on the `NavAnchor` template — no specific observer party is required for read access; any participant on the synchronizer can fetch `NavAnchor` contracts by template ID. The explicit `operator` observer is for backend efficiency (the operator's own indexer needs to react to NAV changes, e.g., to refresh the user app's display).
 
 Each publication archives the previous `NavAnchor` for that instrument and creates a new one. Consumers index the active `NavAnchor` per instrument as the canonical on-chain NAV.
 
@@ -474,11 +471,13 @@ The operator party's actAs/readAs credentials are stored as environment variable
 
 | Component | Where | How |
 |---|---|---|
-| dvUSDCx + USDCx Holdings | Canton synchronizer | Daml templates from `ditto-vault-contracts` |
-| BurnMintFactory contracts | Canton synchronizer | Daml templates from `ditto-vault-contracts` |
+| dvToken Holdings (`dvUSDCx`, `dvUSDCx-LOCK90`, `dvCC`, …) | Canton synchronizer | Daml templates from `ditto-vault-contracts`, issued by `ditto-vault-1` |
+| BurnMintFactory contracts (one per dvToken) | Canton synchronizer | Daml templates from `ditto-vault-contracts` |
+| Base-asset Holdings (`USDCx`, `CC`, `CBTC`) | Canton synchronizer | Issued externally (Circle for USDCx on MainNet, SVs for CC, etc.) |
+| `NavAnchor` per dvToken instrument | Canton synchronizer | Daml templates from `ditto-vault-contracts`, signed by `ditto-vault-1` |
 | Alpend / Cantex positions | Canton synchronizer | Daml templates from respective protocols |
 | DVN attestations | Canton synchronizer | Daml templates from `ditto-oracle` (dedicated party) |
-| Express.js + indexer + strategy router | Application server | Docker container, Express.js process |
+| Express.js API + indexer + strategy router + marker submission service | Application server | Docker container, Express.js process |
 | PostgreSQL | Application server (managed) | Managed PG instance |
 | User app (React) | Application server | Static bundle served by Express |
 | Admin dashboard | Application server | Static bundle served by Express, gated by domain |
