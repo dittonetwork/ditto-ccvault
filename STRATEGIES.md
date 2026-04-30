@@ -58,13 +58,28 @@ Recursive deposit-borrow-resupply loop on Alpend, capped to a safe LTV well belo
 3. Swap CC → USDCx via Cantex.
 4. Re-supply USDCx, return to step 2 until target loop count is reached.
 
-**Net APY** depends on the spread between Alpend USDCx supply rate and CC borrow rate, plus Cantex swap costs. The leg is enabled only when:
+**Loop math (3 loops at 80% LTV)**
+
+Per unit of leg notional (initial USDCx deposit = 1), the cumulative balances after each loop are:
+
+| Loop | USDCx supplied (cumulative) | CC borrowed (cumulative, USDCx-equivalent) | Cantex swaps |
+|---|---|---|---|
+| 0 | 1.000 | 0.000 | 0 |
+| 1 | 1.800 | 0.800 | 1 |
+| 2 | 2.440 | 1.440 | 2 |
+| 3 | 2.952 | 1.952 | 3 |
+
+Each loop adds an LTV-fraction of the prior layer (0.8 × previous deposit), forming a truncated geometric series.
+
+**Net APY (per unit of leg notional)**:
 
 ```
-USDCx_supply_apy − (CC_borrow_apy × loop_factor) − swap_friction > minimum_spread
+net_apy = 2.952 × supply_apy − 1.952 × borrow_apy − 3 × swap_fee_rate
 ```
 
-This is a *modeled* return, not a measured one — it depends on Alpend's CC borrow market having sufficient depth and a stable rate spread, which are not yet published. The leg ships in the **off-by-default** state and is enabled per measured market data.
+**Breakeven** (ignoring swap fees): `supply_apy / borrow_apy = 1.952 / 2.952 ≈ 0.66`. Including Cantex swap fees, breakeven shifts up by a few percentage points depending on Cantex pricing. Trigger T1 in §4 unwinds the leg at `supply_apy < 0.75 × borrow_apy`, which adds margin above breakeven for swap friction and rate volatility.
+
+These numbers are **modeled, not measured** — they assume sufficient depth in Alpend's CC borrow market and a stable rate spread, neither of which is published yet. The leg ships in the **off-by-default** state and is enabled per measured market data. Loop count and LTV are configuration parameters; if either changes, the table and breakeven point above must be re-derived.
 
 **Risk surface**
 - **Rate-spread inversion** — if the borrow rate exceeds the supply rate × loop factor, the leg becomes unprofitable. Triggered unwind in §4.
@@ -76,12 +91,15 @@ This is a *modeled* return, not a measured one — it depends on Alpend's CC bor
 USDCx/CC liquidity provision on Cantex with a short-CC hedge sized to neutralize the LP position's delta exposure to CC.
 
 **Mechanism**
-1. Provide USDCx + CC to a Cantex USDCx/CC pool, receiving LP receipt.
-2. Compute LP position's CC exposure (depends on pool curve and current price).
-3. Borrow CC on Alpend in size matching the long-CC component of the LP, swap to USDCx, re-supply USDCx as collateral.
-4. Net result: LP earns swap fees, hedge cost is the CC borrow rate, market direction is neutralized.
 
-**Net APY** = realized Cantex pool fee APY − CC borrow rate − hedge funding friction. The realized fee APY for Cantex pools is unpublished and will be measured via small live LP positions before this leg is sized to target weight.
+The construction pairs a short-CC borrow with a long-CC LP exposure of equal size, so the leg is market-neutral and earns Cantex swap fees minus CC borrow funding:
+
+1. Supply USDCx to Alpend as collateral. Sized so that the maximum borrow against this collateral covers the CC needed in step 3 (e.g., for 80% LTV and a 50/50 pool, supply ≈ 1.25× the CC-leg's USDCx-equivalent value).
+2. Borrow `Z` CC from Alpend against the USDCx collateral, where `Z` equals the CC-leg of the planned Cantex LP deposit. The borrow opens a short-CC obligation.
+3. Pair the borrowed `Z` CC with the remaining USDCx and provide as liquidity to the Cantex USDCx/CC pool, receiving an LP receipt. The LP's long-CC exposure of size `Z` exactly cancels the borrow obligation.
+4. Net position: market-neutral. The leg earns Cantex swap fees, pays the CC borrow rate as hedge funding cost, and remains exposed to LP curve nonlinearities (delta drifts as price moves; rehedge trigger T3 in §4).
+
+**Net APY** = realized Cantex pool fee APY (scaled by the LP's share of the pool) − CC borrow rate × `Z`/notional − hedge funding friction. The realized fee APY for Cantex pools is unpublished and will be measured via small live LP positions before this leg is sized to target weight.
 
 **Risk surface**
 - **Imperfect hedge** — pool curve nonlinearities mean delta drifts as price moves. Rehedge trigger in §4 caps drift.
@@ -133,7 +151,7 @@ The router evaluates these continuously. Each trigger has a deterministic action
 
 | # | Trigger | Action |
 |---|---|---|
-| T1 | Alpend USDCx supply APY < (Alpend CC borrow APY × 0.6) | Unwind Leg 2 immediately |
+| T1 | Alpend USDCx supply APY < (Alpend CC borrow APY × 0.75) | Unwind Leg 2 immediately. Threshold derived from §2 Leg 2 loop math; see "Loop math" subsection. |
 | T2 | Leg 2 health factor < 1.5 | Auto-deleverage to HF ≥ 1.8 |
 | T3 | Leg 3 pool delta drift > 10% from neutral | Rehedge |
 | T4 | Any Alpend pool utilization > 95% | Pause new Alpend deposits, route to Cantex / buffer |

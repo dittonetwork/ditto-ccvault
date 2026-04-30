@@ -294,6 +294,19 @@ Canton DeFi today lacks a native price-and-state oracle equivalent to Chainlink 
 
 Feed publication is gated by an `m-of-n` operator quorum. Operators co-sign attestation payloads using a threshold signature scheme (signature scheme TBD, current candidates include BLS aggregate and FROST). Operators are slashable via the Eigenlayer/Symbiotic restaking layer for misattestation, providing cryptoeconomic security distinct from any single party's reputation.
 
+### Note on cryptoeconomic anchor
+
+The Eigenlayer/Symbiotic slashing layer fires on **Ethereum**, not Canton. To use that security for Canton-side attestations, an AVS-style integration is required: an AVS contract on Ethereum defines slashable conditions; a fault-proof channel from Canton to Ethereum carries proofs of operator misbehavior; operators opt into the AVS.
+
+This is an **Ethereum security dependency, not a yield bridge**. The Tokenomics Committee's April 2026 ruling restricted bridging stablecoins from Canton to Ethereum to generate yield; an Ethereum-anchored slashing root for verification feeds is a different mechanism with no asset flow. No user funds, no protocol balances, and no yield cross between the two networks — only attestation proofs do, and only under a slashing-condition trigger.
+
+Alternatives under evaluation before Phase 5 ships:
+
+- **Canton-native operator bond** — operators post CC collateral on Canton, slashable by DSO governance vote on misattestation. Removes the Ethereum dependency entirely; loses the existing $200M+ TVL anchor.
+- **Hybrid** — primary slashing on Ethereum (existing operator set), supplementary Canton-native bond for protocols that require pure-Canton residency.
+
+Final design will be specified in the Phase 5 design doc.
+
 ### Feed types
 
 | Feed | Content | Cadence | Consumers |
